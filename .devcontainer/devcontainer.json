@@ -1,0 +1,17 @@
+{
+  "name": "AWS AppStream Bastion IaC",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/aws-cli:1": {},
+    "ghcr.io/devcontainers/features/terraform:1": {}
+  },
+  "containerEnv": {
+    "AWS_ACCESS_KEY_ID": "${localEnv:AWS_ACCESS_KEY_ID}",
+    "AWS_SECRET_ACCESS_KEY": "${localEnv:AWS_SECRET_ACCESS_KEY}",
+    "AWS_ROLE_ARN": "${localEnv:AWS_ROLE_ARN}",
+    "AWS_SERIAL_NUMBER": "${localEnv:AWS_SERIAL_NUMBER}",
+    "TF_VAR_github_organization": "${localEnv:GITHUB_ORGANIZATION}"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "remoteUser": "vscode"
+}
