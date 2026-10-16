@@ -1,37 +1,98 @@
 # GitHub OAuth App の準備
 
-この手順は GitHub OAuth App の登録情報を用意するものです。**現在の Terraform / AppStream 構成には OAuth 連携が実装されていないため、登録した App だけでは AppStream にサインインできません。** GitHub OAuth と AppStream の間に置く認証ブローカー / SAML IdP とその callback URL を選定してから、本番用 OAuth App を完成させてください。
+このリポジトリは API Gateway + Lambda で GitHub OAuth を処理し、指定 Organization の有効なメンバーにだけ AppStream 起動 URL を発行します。Cognito、OIDC ラッパー、SAML IdP、管理者の PAT は不要です。
 
-## 1. 認証ブローカーを決める
+## 1. Terraform で callback 先を作成する
 
-GitHub OAuth App の Authorization callback URL は、OAuth 応答を受け取るアプリケーションの URL です。現状このリポジトリには callback を受け取るサービスがありません。README に記載されていた Cognito User Pool の `/oauth2/idpresponse` URL を指定しないでください。Cognito User Pool はその URL で GitHub OAuth の汎用プロバイダーにはならず、AppStream 向け SAML アサーションの発行者にもなりません。
+[README.md](README.md) の準備を済ませ、Terraform を apply します。GitHub OAuth App が未作成でも AWS リソースは作成できます。
 
-GitHub OAuth を受け付け、必要に応じて GitHub 組織メンバーシップを検証し、AppStream がサポートする SAML サインインを開始できるブローカーを選定します。ブローカーの設定後、管理者から次の値を受け取ってください。
+```sh
+cd terraform
+terraform init
+terraform apply
+terraform output -raw appstream_login_url
+terraform output -raw github_oauth_callback_url
+terraform output -raw github_oauth_secret_arn
+```
 
-- OAuth App の Homepage URL
-- OAuth App の Authorization callback URL
-- 組織メンバーシップ検証に必要な OAuth scope とトークン管理方針
+以下の値を控えます。
 
-これらの URL や scope はブローカーに依存するため、このリポジトリでは固定値を定義していません。
+| Terraform output | 用途 |
+| --- | --- |
+| `appstream_login_url` | 利用者のログイン URL / OAuth App の Homepage URL |
+| `github_oauth_callback_url` | OAuth App の Authorization callback URL |
+| `github_oauth_secret_arn` | Client ID / Secret を保存する Secrets Manager の ARN |
+
+callback URL は `https://<API-ID>.execute-api.<region>.amazonaws.com/callback` です。出力値をそのまま使用し、末尾に `/` を付けないでください。Cognito の `/oauth2/idpresponse` ではありません。
+
+この時点では Secret の値が空のため、ログインすると 503 になります。
 
 ## 2. OAuth App を作成する
 
-1. GitHub で **Settings → Developer settings → OAuth Apps → New OAuth App** を開きます。Organization 管理者が管理する場合は、組織のポリシーに従ってください。
+1. GitHub の **Settings → Developer settings → OAuth Apps → New OAuth App** を開きます。Organization 所有にする場合は、その組織の設定から作成します。
 2. **Application name** に用途が分かる名前を入力します。
-3. **Homepage URL** に、選定したブローカーの URL を入力します。
-4. **Authorization callback URL** に、ブローカーが指定した callback URL を入力します。ローカル検証と本番では URL が異なる場合があるため、環境ごとの OAuth App を分けることを検討してください。
-5. 作成後に Client ID を記録し、**Generate a new client secret** から Client Secret を発行します。Secret は安全な Secrets 管理先に保管し、リポジトリや README に記載しないでください。
+3. **Homepage URL** に `appstream_login_url` の出力値を入力します。
+4. **Authorization callback URL** に `github_oauth_callback_url` の出力値を入力します。
+5. 作成後、Client ID を控え、**Generate a new client secret** から Client Secret を発行します。
 
-ブローカーと callback URL が未決定の場合は、仮の Cognito URL で OAuth App を作成せず、値が決まってから登録してください。
+環境ごとに OAuth App を分けてください。API Gateway を作り直して URL が変わった場合は、OAuth App の登録値も更新します。
 
-## 3. 組織メンバーシップ確認
+## 3. Client ID / Secret を Secrets Manager に登録する
 
-プライベートな GitHub Organization のメンバーシップを確認する場合、ブローカーが要求する最小権限を選びます。OAuth App で `read:org` scope が必要となる構成では、その権限が求められる理由とトークンの保存・更新・失効方法を確認してください。利用者に表示される認可画面で、要求する scope を必要最小限にします。
+AWS コンソールで Terraform の対象リージョンの **Secrets Manager** を開き、`github_oauth_secret_arn` に一致する Secret に次の JSON を値として設定します。
 
-README の旧サンプルにあった Lambda の Pre Sign-up / Pre Authentication コードはこのリポジトリには実装されていません。GitHub API の確認だけを追加しても AppStream への SAML ログインが成立するわけではありません。また、PAT を Codespaces Secrets に登録する手順はありません。
+```json
+{
+  "client_id": "YOUR_GITHUB_OAUTH_CLIENT_ID",
+  "client_secret": "YOUR_GITHUB_OAUTH_CLIENT_SECRET"
+}
+```
 
-## 4. Client ID / Secret の保管
+Terraform は Secret の入れ物だけを作成し、値を作成・取得しません。**値を `.tf`、`.tfvars`、リポジトリ、Terraform state、Codespaces Secrets に記載しないでください。** `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` 環境変数も使用しません。
 
-現在の `.devcontainer/devcontainer.json` と Terraform は `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` を参照しません。認証ブローカー実装後、ブローカーの実行環境が要求する Secrets 名と保管先に登録してください。Codespaces Secrets に登録するだけでは Terraform や AppStream に連携されません。
+AWS CLI を使う場合は、上記 JSON をリポジトリ外の自分だけが読める一時ファイル（権限 `600`）に用意し、`terraform` ディレクトリで実行します。Secret をコマンドラインに直接書くとシェル履歴等に残るため避けてください。
 
-Client Secret が漏えいした場合は OAuth App の設定から再発行し、ブローカー側の Secret を更新した後、古い Secret を失効させてください。
+```sh
+aws secretsmanager put-secret-value \
+  --secret-id "$(terraform output -raw github_oauth_secret_arn)" \
+  --secret-string file:///ABSOLUTE/PATH/github-oauth.json \
+  --profile terraform-role \
+  --region ap-northeast-1
+```
+
+パスとリージョンは実環境に合わせ、登録後は一時ファイルを削除してください。登録作業者には、この Secret に対する `secretsmanager:PutSecretValue` が必要です。Lambda には読み取りだけを許可しています。
+
+Lambda はログインごとに最新の Secret を読み取るため、値の登録・更新後の再 apply は不要です。
+
+## 4. Organization のアクセス許可
+
+利用を許可する組織は Terraform の `github_organization` です。Codespaces では `GITHUB_ORGANIZATION` が `TF_VAR_github_organization` に設定されます。
+
+- Lambda は GitHub に `read:org` scope を要求します。コード・リポジトリ読み取りの `repo` scope は要求しません。
+- GitHub の `/user` で本人の数値 ID を取得し、`/user/memberships/orgs/<Organization>` の `state` が `active` の場合だけ許可します。
+- 非公開の組織メンバーも確認できます。招待待ちの `pending` メンバーや非メンバーは拒否します。
+- Organization が OAuth App access restrictions を有効にしている場合、組織管理者による App の承認が必要です。利用者は GitHub の認可画面で対象 Organization へのアクセスを許可してください。
+- SAML SSO を使用する Organization では、GitHub 側のポリシーに従って SSO 認証・認可も完了してください。これは AppStream に SAML で接続するという意味ではありません。
+- 承認不足、GitHub API 障害、API 制限の場合は起動 URL を発行せずエラーにします。Organization の許可を回避するフォールバックはありません。
+
+## 5. 動作確認
+
+1. `appstream_login_url` をブラウザーで開き、GitHub にログインして認可します。
+2. 対象 Organization の有効なメンバーなら AppStream にリダイレクトされることを確認します。Fleet が稼働し、容量とアプリケーションが利用可能である必要があります。
+3. 別のブラウザープロファイル等を使い、非メンバーでは起動できないことを確認します。
+4. 使用済み callback URL の再送や、Cookie のないブラウザーでの callback 呼び出しが 400 になることを確認します。
+
+エラー時は Lambda の CloudWatch Logs（`/aws/lambda/github-auth-bustion-<Organization>`）を確認してください。エラーコードを記録し、GitHub のコード・トークン・Client Secret・AppStream 起動 URL は記録しません。API Gateway のリクエスト URL 全体や Lambda イベント全体を追加でログに出さないでください。
+
+| 応答 | 主な原因 |
+| --- | --- |
+| 400 | state の不一致・10 分の期限切れ・再使用、認可キャンセル、コード交換失敗 |
+| 403 | 非メンバー、招待待ち |
+| 502 | GitHub API の障害・アクセス制限・不正な応答 |
+| 503 | Secret 未登録・形式不備、AWS 権限不足、Fleet / 起動処理が利用不能 |
+
+## 6. トークン管理と失効
+
+GitHub のアクセストークンは本人・メンバーシップ確認にだけ使用し、Lambda の処理後に永続保存しません。リフレッシュトークンによる継続利用もしません。ただし保存しないことと GitHub 側で失効することは別です。利用を取り消す場合は、GitHub の **Settings → Applications → Authorized OAuth Apps** から認可を取り消してください。
+
+Client Secret が漏えいした場合は GitHub 側で再発行し、Secrets Manager の値を更新した後、古い Secret を失効させます。OAuth App を削除しても開始済みの AppStream セッションは終了しません。Organization からの削除も次回起動から反映されるため、即時遮断が必要なら AppStream 側でセッションを終了してください。

@@ -5,7 +5,7 @@ variable "region" {
 }
 
 variable "github_organization" {
-  description = "GitHub organization used to suffix AWS resource names."
+  description = "GitHub organization whose active members may launch AppStream; also used in resource names."
   type        = string
 
   validation {

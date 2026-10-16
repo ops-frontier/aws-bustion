@@ -32,6 +32,8 @@ IAM でロールを作成し、信頼ポリシーの Principal を前項の IAM 
 
 このロールには、Terraform が作成・更新・削除する VPC / EC2 ネットワーク、AppStream、Application Auto Scaling、CloudWatch Alarm の操作権限が必要です。また AppStream のサービスリンクロールをまだ作成していないアカウントでは、`iam:CreateServiceLinkedRole` を `appstream.amazonaws.com` に対して許可してください。権限は対象リージョン・リソースに絞り、必要な読み取り権限と削除権限も含めてください。広範な管理ポリシーを常用するのではなく、組織の IAM 管理者が実際の Terraform plan に必要な権限を確認してください。
 
+GitHub 認証サービス用に API Gateway v2、Lambda、DynamoDB、Secrets Manager、CloudWatch Logs と Lambda 実行ロール / インラインポリシーの作成・更新・削除権限、およびそのロールを Lambda に渡す `iam:PassRole` も必要です。OAuth 資格情報を登録する作業者には、Terraform が作成した Secret に限定した `secretsmanager:PutSecretValue` を許可してください。Secret の値は Terraform で管理しません。
+
 IAM ユーザー側には、作成したロール ARN に対する `sts:AssumeRole` を許可します。信頼ポリシーとユーザーの許可ポリシーの両方が必要です。
 
 ## 3. Codespaces Secrets
@@ -45,8 +47,11 @@ GitHub リポジトリの **Settings → Secrets and variables → Codespaces** 
 | `AWS_ROLE_ARN` | Terraform 実行ロール ARN |
 | `AWS_SERIAL_NUMBER` | MFA デバイス ARN（例: `arn:aws:iam::123456789012:mfa/iac-operator`） |
 | `GITHUB_ORGANIZATION` | リソース名に使用する GitHub 組織名 |
+| `APPSTREAM_IMAGE_NAME` | 対象リージョンに公開済みの AppStream イメージ名 |
 
 Codespace を再作成すると Dev Container の post-create スクリプトが AWS CLI の `base` と `terraform-role` プロファイルを設定します。値は Codespaces Secrets から環境変数として渡され、AWS 設定ファイルはユーザーのみ読み書きできる権限で作成されます。
+
+同スクリプトが `GITHUB_ORGANIZATION` と `APPSTREAM_IMAGE_NAME` を `TF_VAR_github_organization` と `TF_VAR_appstream_image_name` に転記し、新しい Bash ターミナルで読み込むよう設定します。Codespaces Secrets には大文字の名前だけを登録してください。
 
 ## 4. 認証の確認
 

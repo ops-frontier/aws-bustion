@@ -74,7 +74,7 @@ resource "aws_route_table_association" "private" {
 }
 
 resource "aws_security_group" "appstream" {
-  name        = "sg-appstream-${local.name_suffix}"
+  name        = "appstream-${local.name_suffix}"
   description = "Egress for AppStream sessions through the regional NAT gateway."
   vpc_id      = aws_vpc.main.id
 
@@ -95,12 +95,12 @@ resource "aws_iam_service_linked_role" "appstream" {
 }
 
 resource "aws_appstream_fleet" "main" {
-  name                         = "fleet-${local.name_suffix}"
-  image_name                   = var.appstream_image_name
-  instance_type                = "stream.standard.xlarge"
-  fleet_type                   = "ON_DEMAND"
-  stream_view                  = "APP"
-  max_sessions_per_instance    = 7
+  name                           = "fleet-${local.name_suffix}"
+  image_name                     = var.appstream_image_name
+  instance_type                  = "stream.standard.xlarge"
+  fleet_type                     = "ON_DEMAND"
+  stream_view                    = "APP"
+  max_sessions_per_instance      = 7
   enable_default_internet_access = false
 
   compute_capacity {

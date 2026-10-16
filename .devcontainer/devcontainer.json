@@ -10,8 +10,8 @@
     "AWS_SECRET_ACCESS_KEY": "${localEnv:AWS_SECRET_ACCESS_KEY}",
     "AWS_ROLE_ARN": "${localEnv:AWS_ROLE_ARN}",
     "AWS_SERIAL_NUMBER": "${localEnv:AWS_SERIAL_NUMBER}",
-    "TF_VAR_github_organization": "${localEnv:GITHUB_ORGANIZATION}"
+    "GITHUB_ORGANIZATION": "${localEnv:GITHUB_ORGANIZATION}",
+    "APPSTREAM_IMAGE_NAME": "${localEnv:APPSTREAM_IMAGE_NAME}"
   },
-  "postCreateCommand": "bash .devcontainer/post-create.sh",
-  "remoteUser": "vscode"
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
 }
