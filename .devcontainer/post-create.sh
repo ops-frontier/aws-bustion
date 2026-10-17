@@ -5,10 +5,10 @@ set -euo pipefail
 : "${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in Codespaces secrets}"
 : "${AWS_ROLE_ARN:?Set AWS_ROLE_ARN in Codespaces secrets}"
 : "${AWS_SERIAL_NUMBER:?Set AWS_SERIAL_NUMBER in Codespaces secrets}"
-: "${GITHUB_ORGANIZATION:?Set GITHUB_ORGANIZATION in Codespaces secrets}"
+: "${BUSTION_GITHUB_ORGANIZATION:?Set BUSTION_GITHUB_ORGANIZATION in Codespaces secrets}"
 : "${APPSTREAM_IMAGE_NAME:?Set APPSTREAM_IMAGE_NAME in Codespaces secrets}"
 
-export TF_VAR_github_organization="$GITHUB_ORGANIZATION"
+export TF_VAR_github_organization="$BUSTION_GITHUB_ORGANIZATION"
 export TF_VAR_appstream_image_name="$APPSTREAM_IMAGE_NAME"
 
 mkdir -p "$HOME/.aws"
@@ -22,10 +22,13 @@ aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
 EOF
 
 cat > "$HOME/.aws/config" <<EOF
-[profile terraform-role]
+[profile terraform-mfa]
 role_arn = ${AWS_ROLE_ARN}
 source_profile = base
 mfa_serial = ${AWS_SERIAL_NUMBER}
+region = ap-northeast-1
+
+[profile terraform-role]
 region = ap-northeast-1
 EOF
 

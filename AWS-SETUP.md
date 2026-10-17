@@ -30,7 +30,9 @@ IAM でロールを作成し、信頼ポリシーの Principal を前項の IAM 
 
 `Principal` は実際のアカウント ID と IAM ユーザー ARN に置き換えてください。作成後、ロール ARN を控えます。
 
-このロールには、Terraform が作成・更新・削除する VPC / EC2 ネットワーク、AppStream、Application Auto Scaling、CloudWatch Alarm の操作権限が必要です。また AppStream のサービスリンクロールをまだ作成していないアカウントでは、`iam:CreateServiceLinkedRole` を `appstream.amazonaws.com` に対して許可してください。権限は対象リージョン・リソースに絞り、必要な読み取り権限と削除権限も含めてください。広範な管理ポリシーを常用するのではなく、組織の IAM 管理者が実際の Terraform plan に必要な権限を確認してください。
+このロールには、Terraform が作成・更新・削除する VPC / EC2 ネットワーク、AppStream、Application Auto Scaling、CloudWatch Alarm の操作権限が必要です。AppStream 用には、通常の IAM サービスロール `AmazonAppStreamServiceAccess` の作成・取得・信頼ポリシー更新・削除と、同名の AWS 管理ポリシーのアタッチ・デタッチ・一覧取得などの権限が必要です。これはサービスリンクロールではないため、`appstream.amazonaws.com` を指定した `iam:CreateServiceLinkedRole` では作成できません。既存ロールがある場合の import 手順は [Terraform の説明](terraform/README.md#appstream-service-role) を参照してください。一方、Application Auto Scaling の初回利用では `appstream.application-autoscaling.amazonaws.com` に対する `iam:CreateServiceLinkedRole` が必要になる場合があります。権限は対象リージョン・リソースに絞り、必要な読み取り権限と削除権限も含めてください。広範な管理ポリシーを常用するのではなく、組織の IAM 管理者が実際の Terraform plan に必要な権限を確認してください。
+
+`AmazonAppStreamServiceAccess` は IAM パス `/service-role/` に作成します。ロール ARN は `arn:aws:iam::<account-id>:role/service-role/AmazonAppStreamServiceAccess` になります。パス `/` に作成済みの場合、パスの修正にはロールの再作成が必要です。共有ロールのため、他の AppStream 環境への影響を確認してから適用してください。[InvalidRoleException の復旧手順](terraform/README.md#recovering-from-invalidroleexception) を参照してください。
 
 GitHub 認証サービス用に API Gateway v2、Lambda、DynamoDB、Secrets Manager、CloudWatch Logs と Lambda 実行ロール / インラインポリシーの作成・更新・削除権限、およびそのロールを Lambda に渡す `iam:PassRole` も必要です。OAuth 資格情報を登録する作業者には、Terraform が作成した Secret に限定した `secretsmanager:PutSecretValue` を許可してください。Secret の値は Terraform で管理しません。
 
@@ -44,24 +46,29 @@ GitHub リポジトリの **Settings → Secrets and variables → Codespaces** 
 | --- | --- |
 | `AWS_ACCESS_KEY_ID` | IAM ユーザーのアクセスキー ID |
 | `AWS_SECRET_ACCESS_KEY` | IAM ユーザーの Secret access key |
-| `AWS_ROLE_ARN` | Terraform 実行ロール ARN |
+| `AWS_ROLE_ARN` | Terraform 実行ロールの完全な ARN（例: `arn:aws:iam::123456789012:role/terraform-admin`）。ロール名のみは不可 |
 | `AWS_SERIAL_NUMBER` | MFA デバイス ARN（例: `arn:aws:iam::123456789012:mfa/iac-operator`） |
-| `GITHUB_ORGANIZATION` | リソース名に使用する GitHub 組織名 |
+| `BUSTION_GITHUB_ORGANIZATION` | リソース名に使用する GitHub 組織名 |
 | `APPSTREAM_IMAGE_NAME` | 対象リージョンに公開済みの AppStream イメージ名 |
 
-Codespace を再作成すると Dev Container の post-create スクリプトが AWS CLI の `base` と `terraform-role` プロファイルを設定します。値は Codespaces Secrets から環境変数として渡され、AWS 設定ファイルはユーザーのみ読み書きできる権限で作成されます。
+Codespace を再作成すると Dev Container の post-create スクリプトが元のアクセスキーを `~/.aws/credentials` の `base` に保存します。`~/.aws/config` の `terraform-mfa` にロール ARN・`source_profile = base`・MFA デバイス ARN を設定し、`terraform-role` にはリージョンのみを設定します。値は Codespaces Secrets から環境変数として渡され、AWS 設定ファイルはユーザーのみ読み書きできる権限で作成されます。初期化時には MFA 入力を求めず、ロールの一時認証情報はまだありません。
 
-同スクリプトが `GITHUB_ORGANIZATION` と `APPSTREAM_IMAGE_NAME` を `TF_VAR_github_organization` と `TF_VAR_appstream_image_name` に転記し、新しい Bash ターミナルで読み込むよう設定します。Codespaces Secrets には大文字の名前だけを登録してください。
+同スクリプトが `BUSTION_GITHUB_ORGANIZATION` と `APPSTREAM_IMAGE_NAME` を `TF_VAR_github_organization` と `TF_VAR_appstream_image_name` に転記し、新しい Bash ターミナルで読み込むよう設定します。Codespaces Secrets には大文字の名前だけを登録してください。
 
 ## 4. 認証の確認
 
-Dev Container のターミナルで次を実行します。AWS CLI が MFA コードを尋ねたら認証アプリ等に表示された現在のコードを入力してください。
+Dev Container のターミナルで、リポジトリ直下から次を実行します。Python スクリプトが標準出力に `MFA OTP (6 digits):` と表示したら、認証アプリ等に表示された現在のコードを標準入力から入力してください。Python 3 と AWS CLI は Dev Container にインストールされます。
 
 ```sh
+python3 scripts/login.py
 aws sts get-caller-identity --profile terraform-role
 ```
 
-返された ARN が作成した実行ロールであることを確認します。ロールセッションの有効期限後は再度 MFA コードの入力が必要です。Terraform provider も `terraform-role` を使用します。
+スクリプトは `terraform-mfa` の設定を読み取り、`base` の認証情報で AWS STS AssumeRole を呼び出します。取得した 3 つの一時認証情報（アクセスキー ID・シークレットキー・セッショントークン）を `~/.aws/credentials` の `terraform-role` に保存します。他のプロファイルは保持し、ファイルは権限 `600` で原子的に更新します。AWS API エラー、設定不備、不正な OTP 等はエラー終了し、既存の認証情報を変更しません。OTP や認証情報をログ・チャット・Git に保存しないでください。
+
+返された ARN が作成した実行ロールであることを確認します。Terraform provider と以後の AWS CLI 操作は `terraform-role` を使用し、追加の MFA 入力はありません。Terraform provider は対話的な MFA 入力に対応しないため、`terraform-role` に `role_arn`・`source_profile`・`mfa_serial` を設定しないでください。
+
+スクリプトに表示される有効期限（既定で 1 時間）を過ぎたら `python3 scripts/login.py` を再実行します。`post-create.sh` を再実行した場合も一時認証情報が削除されるため、再ログインしてください。AWS の設定パスを変更する場合、スクリプトは `AWS_CONFIG_FILE` と `AWS_SHARED_CREDENTIALS_FILE` に対応しますが、Terraform provider の `shared_config_files` / `shared_credentials_files` も同じパスに変更する必要があります。
 
 ## 5. 失効・ローテーション
 

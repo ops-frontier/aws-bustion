@@ -52,6 +52,8 @@ Terraform は Secret の入れ物だけを作成し、値を作成・取得し�
 
 AWS CLI を使う場合は、上記 JSON をリポジトリ外の自分だけが読める一時ファイル（権限 `600`）に用意し、`terraform` ディレクトリで実行します。Secret をコマンドラインに直接書くとシェル履歴等に残るため避けてください。
 
+事前にリポジトリ直下で `python3 scripts/login.py` を実行し、MFA コードを入力して `terraform-role` の一時認証情報を取得してください。期限切れ時も同じ手順で再ログインします。
+
 ```sh
 aws secretsmanager put-secret-value \
   --secret-id "$(terraform output -raw github_oauth_secret_arn)" \
@@ -66,7 +68,7 @@ Lambda はログインごとに最新の Secret を読み取るため、値の�
 
 ## 4. Organization のアクセス許可
 
-利用を許可する組織は Terraform の `github_organization` です。Codespaces では `GITHUB_ORGANIZATION` が `TF_VAR_github_organization` に設定されます。
+利用を許可する組織は Terraform の `github_organization` です。Codespaces では `BUSTION_GITHUB_ORGANIZATION` が `TF_VAR_github_organization` に設定されます。
 
 - Lambda は GitHub に `read:org` scope を要求します。コード・リポジトリ読み取りの `repo` scope は要求しません。
 - GitHub の `/user` で本人の数値 ID を取得し、`/user/memberships/orgs/<Organization>` の `state` が `active` の場合だけ許可します。

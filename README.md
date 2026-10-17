@@ -10,7 +10,7 @@ Terraform で Amazon AppStream 2.0 (WorkSpaces Applications) のネットワー�
 - 空きセッション数と稼働率に基づく Fleet のスケーリング
 - API Gateway + Lambda による GitHub OAuth 認証、Organization メンバーシップ確認、AppStream 起動
 - Secrets Manager による OAuth 資格情報管理、DynamoDB による一回限りの OAuth state 管理
-- Codespaces 内の AWS CLI / Terraform と MFA 付き IAM ロールプロファイル
+- Codespaces 内の Python 3 / AWS CLI / Terraform と MFA ログインスクリプト
 
 Terraform は公開済みの AppStream イメージを使用します。イメージのビルド・公開処理は含まれていません。AppStream Image Builder で Chrome、VS Code、日本語環境を含むイメージを作成し、そのイメージ名を Codespaces Secret の `APPSTREAM_IMAGE_NAME` に設定してください。Packer の `amazon-ebs` が作成する EC2 AMI は AppStream イメージとして直接利用できません。
 
@@ -30,6 +30,7 @@ OAuth は PKCE（S256）と Secure / HttpOnly / SameSite=Lax Cookie に紐づく
 ## 必要な環境
 
 - Terraform 1.6 以降
+- Python 3.10 以降と AWS CLI v2（Dev Container にインストール済み）
 - AWS Provider 6.x
 - Archive Provider 2.7 以降（2.x、Lambda の ZIP 作成に使用）
 - 対象リージョンに作成済みの AppStream イメージ
@@ -37,7 +38,7 @@ OAuth は PKCE（S256）と Secure / HttpOnly / SameSite=Lax Cookie に紐づく
 
 | 名前 | 用途 |
 | --- | --- |
-| `GITHUB_ORGANIZATION` | 利用を許可する GitHub Organization、リソース名の末尾、`TF_VAR_github_organization` |
+| `BUSTION_GITHUB_ORGANIZATION` | 利用を許可する GitHub Organization、リソース名の末尾、`TF_VAR_github_organization` |
 | `APPSTREAM_IMAGE_NAME` | 公開済み AppStream イメージ名、`TF_VAR_appstream_image_name` |
 | `AWS_ACCESS_KEY_ID` | MFA を登録した IAM ユーザーのアクセスキー ID |
 | `AWS_SECRET_ACCESS_KEY` | 同アクセスキーのシークレット |
@@ -48,11 +49,15 @@ OAuth は PKCE（S256）と Secure / HttpOnly / SameSite=Lax Cookie に紐づく
 
 ## 実行
 
-Codespaces の Secrets を設定して Dev Container を作成すると、`post-create.sh` が `~/.aws` に `terraform-role` プロファイルを作成します。Terraform コマンド実行時に MFA コードを求められたら入力してください。
+Codespaces の Secrets を設定して Dev Container を作成すると、`post-create.sh` が `~/.aws` に元のアクセスキー用の `base`、MFA 付き AssumeRole の設定用の `terraform-mfa`、取得した一時認証情報用の `terraform-role` プロファイルを準備します。初期化処理は MFA 入力や AWS API 呼び出しを行いません。
 
-同スクリプトが大文字の `GITHUB_ORGANIZATION` / `APPSTREAM_IMAGE_NAME` を、それぞれ `TF_VAR_github_organization` / `TF_VAR_appstream_image_name` に転記します。設定は `~/.config/aws-bustion/terraform-env.sh` に保存し、`~/.bashrc` から読み込むため、新しく開いた Bash ターミナルで有効です。イメージ名を `-var` で渡す必要はありません。
+Terraform provider は MFA コードを対話入力できないため、先にリポジトリ直下で `python3 scripts/login.py` を実行してください。端末の標準入出力で `MFA OTP (6 digits):` と表示されたら、現在の 6 桁のコードを入力します。スクリプトは AWS CLI で MFA 付き AssumeRole を実行し、アクセスキー・シークレットキー・セッショントークンを `~/.aws/credentials` の `terraform-role` に権限 `600` で保存します。既存の他のプロファイルは保持し、認証情報や OTP を出力せず、有効期限のみ表示します。AWS CLI が返す認証エラー等は標準エラー出力に表示し、失敗時は既存の認証情報を変更しません。
+
+同スクリプトが大文字の `BUSTION_GITHUB_ORGANIZATION` / `APPSTREAM_IMAGE_NAME` を、それぞれ `TF_VAR_github_organization` / `TF_VAR_appstream_image_name` に転記します。設定は `~/.config/aws-bustion/terraform-env.sh` に保存し、`~/.bashrc` から読み込むため、新しく開いた Bash ターミナルで有効です。イメージ名を `-var` で渡す必要はありません。
 
 ```sh
+python3 scripts/login.py
+aws sts get-caller-identity --profile terraform-role
 cd terraform
 terraform init
 terraform plan
@@ -64,9 +69,11 @@ terraform output -raw github_oauth_secret_arn
 
 Secret を変更した場合は Codespace を再起動して環境変数を反映し、リポジトリ直下で `bash .devcontainer/post-create.sh` を再実行してください。その後、新しい Bash ターミナルを開くか、既存のターミナルで `source "$HOME/.config/aws-bustion/terraform-env.sh"` を実行します。
 
+一時認証情報は既定で 1 時間有効です。期限切れ時はリポジトリ直下で `python3 scripts/login.py` を再実行してください。`post-create.sh` の再実行は一時認証情報を削除するため、その場合も再ログインが必要です。既存の Dev Container には Python feature を追加するため、コンテナーをリビルドしてください。
+
 apply 後、[GITHUB-SETUP.md](GITHUB-SETUP.md) に従い、出力された callback URL で GitHub OAuth App を作成し、出力された ARN の Secret に資格情報を登録してください。**登録するまではログインできません（503 応答）。** Secret の値は Terraform で作成・取得しないため、Terraform state に入りません。登録後、`appstream_login_url` をブラウザーで開きます。Secret の更新だけなら再 apply は不要です。
 
-既定リージョンは `ap-northeast-1` です。変更する場合は `-var='region=YOUR_AWS_REGION'` のように指定してください。組織名に応じ、AWS リソース名には `bustion-${GITHUB_ORGANIZATION}` が含まれます。
+既定リージョンは `ap-northeast-1` です。変更する場合は `-var='region=YOUR_AWS_REGION'` のように指定してください。組織名に応じ、AWS リソース名には `bustion-${BUSTION_GITHUB_ORGANIZATION}` が含まれます。
 
 Terraform state は現在ローカルに保存されます。Codespace を削除すると state を失う可能性があるため、継続利用や複数人での運用を始める前に、暗号化・アクセス制御された S3 backend と state ロックを構成してください。
 

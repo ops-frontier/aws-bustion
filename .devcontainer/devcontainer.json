@@ -2,6 +2,9 @@
   "name": "AWS AppStream Bastion IaC",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.13"
+    },
     "ghcr.io/devcontainers/features/aws-cli:1": {},
     "ghcr.io/devcontainers/features/terraform:1": {}
   },
@@ -10,7 +13,7 @@
     "AWS_SECRET_ACCESS_KEY": "${localEnv:AWS_SECRET_ACCESS_KEY}",
     "AWS_ROLE_ARN": "${localEnv:AWS_ROLE_ARN}",
     "AWS_SERIAL_NUMBER": "${localEnv:AWS_SERIAL_NUMBER}",
-    "GITHUB_ORGANIZATION": "${localEnv:GITHUB_ORGANIZATION}",
+    "BUSTION_GITHUB_ORGANIZATION": "${localEnv:BUSTION_GITHUB_ORGANIZATION}",
     "APPSTREAM_IMAGE_NAME": "${localEnv:APPSTREAM_IMAGE_NAME}"
   },
   "postCreateCommand": "bash .devcontainer/post-create.sh"

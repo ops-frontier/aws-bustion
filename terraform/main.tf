@@ -90,8 +90,26 @@ resource "aws_security_group" "appstream" {
   }
 }
 
-resource "aws_iam_service_linked_role" "appstream" {
-  aws_service_name = "appstream.amazonaws.com"
+resource "aws_iam_role" "appstream" {
+  name = "AmazonAppStreamServiceAccess"
+  path = "/service-role/"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "appstream.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "appstream" {
+  role       = aws_iam_role.appstream.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAppStreamServiceAccess"
+
+  lifecycle {
+    replace_triggered_by = [aws_iam_role.appstream]
+  }
 }
 
 resource "aws_appstream_fleet" "main" {
@@ -112,7 +130,7 @@ resource "aws_appstream_fleet" "main" {
     security_group_ids = [aws_security_group.appstream.id]
   }
 
-  depends_on = [aws_iam_service_linked_role.appstream]
+  depends_on = [aws_iam_role_policy_attachment.appstream]
 
   tags = {
     Name = "fleet-${local.name_suffix}"
@@ -153,6 +171,8 @@ resource "aws_appstream_stack" "main" {
     action     = "FILE_DOWNLOAD"
     permission = "ENABLED"
   }
+
+  depends_on = [aws_iam_role_policy_attachment.appstream]
 
   tags = {
     Name = "stack-${local.name_suffix}"

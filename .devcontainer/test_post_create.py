@@ -1,3 +1,4 @@
+import configparser
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ REQUIRED = {
     "AWS_SECRET_ACCESS_KEY": "test-secret-key",
     "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/test",
     "AWS_SERIAL_NUMBER": "arn:aws:iam::123456789012:mfa/test",
-    "GITHUB_ORGANIZATION": "example-org",
+    "BUSTION_GITHUB_ORGANIZATION": "example-org",
     "APPSTREAM_IMAGE_NAME": "published-linux-image",
 }
 
@@ -56,10 +57,23 @@ class PostCreateTests(unittest.TestCase):
         )
         aws = Path(self.home.name) / ".aws"
         self.assertIn("role_arn = " + REQUIRED["AWS_ROLE_ARN"], (aws / "config").read_text())
+        profiles = configparser.ConfigParser()
+        profiles.read(aws / "config")
+        self.assertEqual(
+            dict(profiles["profile terraform-role"]), {"region": "ap-northeast-1"}
+        )
+        self.assertEqual(profiles["profile terraform-mfa"]["source_profile"], "base")
+        self.assertEqual(
+            profiles["profile terraform-mfa"]["mfa_serial"], REQUIRED["AWS_SERIAL_NUMBER"]
+        )
+        credentials = configparser.ConfigParser()
+        credentials.read(aws / "credentials")
+        self.assertEqual(credentials.sections(), ["base"])
         self.assertEqual((aws / "config").stat().st_mode & 0o777, 0o600)
         self.assertEqual((aws / "credentials").stat().st_mode & 0o777, 0o600)
         config = json.loads((DIRECTORY / "devcontainer.json").read_text())
-        for name in ("GITHUB_ORGANIZATION", "APPSTREAM_IMAGE_NAME"):
+        self.assertIn("ghcr.io/devcontainers/features/python:1", config["features"])
+        for name in ("BUSTION_GITHUB_ORGANIZATION", "APPSTREAM_IMAGE_NAME"):
             self.assertEqual(config["containerEnv"][name], "${localEnv:" + name + "}")
         self.assertNotIn("TF_VAR_github_organization", config["containerEnv"])
 

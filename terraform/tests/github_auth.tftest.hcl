@@ -52,6 +52,36 @@ run "github_launch_service" {
   command = apply
 
   assert {
+    condition     = aws_iam_role.appstream.name == "AmazonAppStreamServiceAccess"
+    error_message = "AppStream requires the fixed-name service role, not a service-linked role."
+  }
+
+  assert {
+    condition     = aws_iam_role.appstream.path == "/service-role/"
+    error_message = "AppStream looks up AmazonAppStreamServiceAccess under the /service-role/ IAM path."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role.appstream.assume_role_policy) == {
+      Version = "2012-10-17"
+      Statement = [{
+        Effect    = "Allow"
+        Principal = { Service = "appstream.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }]
+    }
+    error_message = "The AppStream service must be able to assume its service role."
+  }
+
+  assert {
+    condition = (
+      aws_iam_role_policy_attachment.appstream.role == aws_iam_role.appstream.name &&
+      aws_iam_role_policy_attachment.appstream.policy_arn == "arn:aws:iam::aws:policy/service-role/AmazonAppStreamServiceAccess"
+    )
+    error_message = "The AppStream service role must have the AWS managed service access policy attached."
+  }
+
+  assert {
     condition     = aws_lambda_function.github_auth.environment[0].variables.GITHUB_ORGANIZATION == "example-org"
     error_message = "Lambda must authorize membership in the configured organization."
   }
