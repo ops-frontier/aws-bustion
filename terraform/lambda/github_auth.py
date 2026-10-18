@@ -183,6 +183,46 @@ def consume_state(event):
     return params, result["Attributes"]["verifier"]["S"]
 
 
+def ensure_fleet_capacity(appstream):
+    fleet_name = os.environ["APPSTREAM_FLEET"]
+    fleets = appstream.describe_fleets(Names=[fleet_name])["Fleets"]
+    if len(fleets) != 1 or fleets[0]["State"] != "RUNNING":
+        raise AuthError(
+            503, "fleet_unavailable", "The fleet is not running. Contact the administrator."
+        )
+    capacity = fleets[0]["ComputeCapacityStatus"]
+    # Preserve reconnection to existing sessions even if no spare instance exists.
+    if capacity["InUse"] > 0:
+        return True
+    if capacity["Desired"] == 0:
+        appstream.update_fleet(
+            Name=fleet_name, ComputeCapacity={"DesiredInstances": 1}
+        )
+        LOGGER.info("Requested first AppStream instance for fleet %s", fleet_name)
+        return False
+    return capacity["Available"] > 0
+
+
+def fleet_warming_response():
+    LOGGER.info("AppStream fleet is provisioning; deferring streaming URL creation")
+    result = response(
+        503,
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta http-equiv="refresh" content="60;url=/login">'
+        "<title>Preparing streaming resources</title></head><body>"
+        "<h1>Preparing streaming resources</h1>"
+        "<p>The fleet is starting. Provisioning usually takes 10-20 minutes. "
+        "This page checks again every 60 seconds via GitHub sign-in.</p>"
+        '<p><a href="/login">Check again</a></p>'
+        "<p>Do not refresh the OAuth callback URL or use AppStream Retry. "
+        "If this continues, contact the administrator.</p></body></html>",
+        cookie="",
+    )
+    result["headers"]["Content-Type"] = "text/html; charset=utf-8"
+    result["headers"]["Retry-After"] = "60"
+    return result
+
+
 def finish_login(event):
     params, verifier = consume_state(event)
     if "error" in params:
@@ -215,7 +255,10 @@ def finish_login(event):
     )
     if membership.get("state") != "active":
         raise AuthError(403, "not_active_member", "Active organization membership is required.")
-    result = aws_client("appstream").create_streaming_url(
+    appstream = aws_client("appstream")
+    if not ensure_fleet_capacity(appstream):
+        return fleet_warming_response()
+    result = appstream.create_streaming_url(
         StackName=os.environ["APPSTREAM_STACK"],
         FleetName=os.environ["APPSTREAM_FLEET"],
         UserId=f"gh-{user_id}",

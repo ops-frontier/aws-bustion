@@ -23,15 +23,33 @@ minutes early so a running instance is ready by 09:00. Widen the lead time if
 provisioning is observed to take longer. Maximum capacity is 22 and initial
 capacity is 1, allowing 20 concurrent users plus spare capacity.
 
-Application Auto Scaling owns desired capacity and, after creation, the
-minimum capacity; Terraform ignores `desired_instances` and the scalable
-target's `min_capacity` so a later apply does not override the schedule.
+Application Auto Scaling manages desired capacity and, after creation, the
+minimum capacity. After GitHub membership verification, the launch Lambda also
+requests `DesiredInstances = 1` if desired capacity and in-use capacity are both
+zero. Terraform ignores `desired_instances` and the scalable target's
+`min_capacity` so a later apply does not override scaling or the schedule.
+
+This explicit wake-up does not depend on a rejected AppStream session or
+CloudWatch metric delivery. While there are neither active sessions nor available
+instances, the Lambda returns a waiting page (HTTP 503, `Retry-After: 60`) instead
+of creating a short-lived streaming URL. The page returns to `/login` every 60
+seconds, rechecking GitHub membership and capacity with a fresh OAuth state.
+Users can also select "Check again"; refreshing a consumed `/callback` or
+pressing AppStream Retry is not the recovery path. Provisioning usually takes
+10-20 minutes. A nonzero desired capacity prevents repeated wake-up requests.
+Existing session reconnection remains unchanged even without spare capacity.
+Missing or stopped fleets and AWS API failures return errors, not a waiting page;
+the Lambda does not start administratively stopped fleets.
+
+The Lambda requires `appstream:DescribeFleets` with `Resource = "*"` (this action
+does not support resource-level permissions), and `appstream:UpdateFleet` scoped
+to this fleet. Apply the Terraform changes to deploy both code and permissions.
 
 - Scale out by one when `InUseCapacity >= 1` and `AvailableCapacity <= 1`, or
   when `InsufficientCapacityError >= 1` while `PendingCapacity == 0`, evaluated
   with metric math over one one-minute period; the scale-out cooldown is 120
-  seconds. The capacity-error branch lets a rejected launch outside business
-  hours start one instance; the user retries after it is provisioned.
+  seconds. The capacity-error branch remains a fallback for rejected launches;
+  normal login to an empty fleet uses the explicit Lambda wake-up above.
 - Scale in by one when `AvailableCapacity >= 3`, or `InUseCapacity == 0` and
   `AvailableCapacity >= 2`, for five consecutive one-minute periods.
 - Scale in by one when `InUseCapacity == 0` and `AvailableCapacity >= 1` for 30

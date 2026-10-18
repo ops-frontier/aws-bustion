@@ -233,6 +233,18 @@ run "github_launch_service" {
 
   assert {
     condition = (
+      toset(jsondecode(aws_iam_role_policy.github_auth.policy).Statement[4].Action) ==
+      toset(["appstream:DescribeFleets"]) &&
+      jsondecode(aws_iam_role_policy.github_auth.policy).Statement[4].Resource == "*" &&
+      toset(jsondecode(aws_iam_role_policy.github_auth.policy).Statement[5].Action) ==
+      toset(["appstream:UpdateFleet"]) &&
+      jsondecode(aws_iam_role_policy.github_auth.policy).Statement[5].Resource == aws_appstream_fleet.main.arn
+    )
+    error_message = "Lambda must be able to inspect capacity and wake only the configured fleet; DescribeFleets requires a wildcard resource."
+  }
+
+  assert {
+    condition = (
       output.appstream_login_url == "${aws_apigatewayv2_api.github_auth.api_endpoint}/login" &&
       output.github_oauth_callback_url == "${aws_apigatewayv2_api.github_auth.api_endpoint}/callback" &&
       output.github_oauth_secret_arn == aws_secretsmanager_secret.github_oauth.arn

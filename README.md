@@ -20,6 +20,7 @@ Terraform は公開済みの AppStream イメージを使用します。イメ�
 利用者 → API Gateway /login → Lambda → GitHub OAuth
        → API Gateway /callback → Lambda
        → GitHub API で本人と Organization の active メンバーシップを確認
+       → Fleet の容量を確認（0 台なら 1 台を要求し、起動準備中は待機画面）
        → AppStream CreateStreamingURL → AppStream にリダイレクト
 ```
 
@@ -84,7 +85,7 @@ Terraform state は現在ローカルに保存されます。Codespace を削除
 - 0 台からの起動には数分〜十数分かかるため、開始時刻を 9:00 より早めています。実際の起動時間が30分を超える場合は、開始時刻をさらに早めてください。
 - 利用中のセッションがあり、空きが 1 台以下になった時点で 1 台追加します。空き 3 台以上、または利用中 0 で空き 2 台以上の状態が 5 分続くと 1 台削減します。スケールアウトのクールダウンは 120 秒、スケールインは 300 秒です。再 apply では自動調整後の容量を初期値に戻しません。
 - 利用中 0 で空きがある状態が 30 分続くと 1 台削減します。日中は最小容量 1 台が残り、17:00 以降は最後の 1 台も停止します。17:00 時点で使用中のセッションは強制終了しません。
-- 時間外（0 台）に接続すると容量不足で失敗しますが、その失敗（`InsufficientCapacityError`）を検知して 1 台起動します。数分〜十数分待ってから、もう一度ログイン URL を開いてください。起動中のインスタンスがある間は追加起動しません。
+- 時間外（0 台）は、GitHub のメンバーシップ確認後に Lambda が `DesiredInstances = 1` を明示的に要求します。CloudWatch の容量不足アラームや AppStream の Retry には依存しません。利用中のセッションも空きもない起動準備中は、起動 URL を発行せず待機画面（503 / `Retry-After: 60`）を表示します。通常 10〜20 分程度かかり、60 秒ごとにログインから認証・容量確認をやり直し、空きができたら AppStream に進みます。手動では「Check again」または元のログイン URL を開いてください（使用済み callback URL の再読み込みは不可）。要求済みの容量がある間は追加要求しません。既存セッションへの再接続は従来どおりです。
 - これらの待ち時間は未使用容量の縮小待ち時間であり、接続中ユーザーの無操作による切断タイムアウトではありません。使用中のセッションはスケールインで強制終了しません。
 - リージョナル NAT Gateway と AppStream の稼働には継続的な料金が発生します。不要時は `terraform destroy` で削除してください。
 - AppStream のサービスロール `AmazonAppStreamServiceAccess` は他の AppStream 環境と共用するため Terraform では管理せず、`terraform destroy` でも削除されません。事前に作成しておく必要があります（[AWS-SETUP.md](AWS-SETUP.md) を参照）。

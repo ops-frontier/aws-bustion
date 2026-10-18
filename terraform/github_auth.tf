@@ -66,6 +66,16 @@ resource "aws_iam_role_policy" "github_auth" {
         Effect   = "Allow"
         Action   = ["appstream:CreateStreamingURL"]
         Resource = [aws_appstream_stack.main.arn, aws_appstream_fleet.main.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["appstream:DescribeFleets"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["appstream:UpdateFleet"]
+        Resource = aws_appstream_fleet.main.arn
       }
     ]
   })

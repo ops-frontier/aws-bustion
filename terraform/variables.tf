@@ -37,7 +37,7 @@ variable "max_capacity" {
 }
 
 variable "desired_capacity" {
-  description = "Initial number of AppStream instances; Application Auto Scaling manages subsequent capacity changes."
+  description = "Initial number of AppStream instances; Application Auto Scaling manages subsequent capacity changes and the launch Lambda wakes an empty fleet."
   type        = number
   default     = 1
 }
