@@ -90,25 +90,33 @@ resource "aws_security_group" "appstream" {
   }
 }
 
-resource "aws_iam_role" "appstream" {
-  name = "AmazonAppStreamServiceAccess"
-  path = "/service-role/"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "appstream.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "appstream" {
-  role       = aws_iam_role.appstream.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAppStreamServiceAccess"
+# The account-wide AppStream service role is shared with other AppStream
+# deployments and managed outside this configuration. The removed blocks drop
+# it from state without deleting it, so destroy never touches it.
+removed {
+  from = aws_iam_role.appstream
 
   lifecycle {
-    replace_triggered_by = [aws_iam_role.appstream]
+    destroy = false
+  }
+}
+
+removed {
+  from = aws_iam_role_policy_attachment.appstream
+
+  lifecycle {
+    destroy = false
+  }
+}
+
+data "aws_iam_role" "appstream" {
+  name = "AmazonAppStreamServiceAccess"
+
+  lifecycle {
+    postcondition {
+      condition     = self.path == "/service-role/"
+      error_message = "AmazonAppStreamServiceAccess must exist under the /service-role/ IAM path; AppStream rejects a role at another path."
+    }
   }
 }
 
@@ -116,9 +124,8 @@ resource "aws_appstream_fleet" "main" {
   name                           = "fleet-${local.name_suffix}"
   image_name                     = var.appstream_image_name
   instance_type                  = "stream.standard.xlarge"
-  fleet_type                     = "ON_DEMAND"
+  fleet_type                     = "ALWAYS_ON"
   stream_view                    = "APP"
-  max_sessions_per_instance      = 7
   enable_default_internet_access = false
 
   compute_capacity {
@@ -130,7 +137,11 @@ resource "aws_appstream_fleet" "main" {
     security_group_ids = [aws_security_group.appstream.id]
   }
 
-  depends_on = [aws_iam_role_policy_attachment.appstream]
+  depends_on = [data.aws_iam_role.appstream]
+
+  lifecycle {
+    ignore_changes = [compute_capacity[0].desired_instances]
+  }
 
   tags = {
     Name = "fleet-${local.name_suffix}"
@@ -144,12 +155,7 @@ resource "aws_appstream_stack" "main" {
   redirect_url = "https://github.com/${var.github_organization}"
 
   application_settings {
-    enabled        = true
-    settings_group = "appstream-${var.github_organization}"
-  }
-
-  storage_connectors {
-    connector_type = "HOMEFOLDERS"
+    enabled = false
   }
 
   user_settings {
@@ -172,16 +178,38 @@ resource "aws_appstream_stack" "main" {
     permission = "ENABLED"
   }
 
-  depends_on = [aws_iam_role_policy_attachment.appstream]
+  depends_on = [data.aws_iam_role.appstream]
 
   tags = {
     Name = "stack-${local.name_suffix}"
   }
 }
 
+# The AWS provider ignores storage_connectors changes on update, so removing the
+# block alone would leave home folders enabled on an existing stack.
+resource "terraform_data" "disable_home_folders" {
+  count            = var.disable_home_folders_with_cli ? 1 : 0
+  triggers_replace = [aws_appstream_stack.main.id]
+
+  provisioner "local-exec" {
+    command = join(" ", [
+      "env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AWS_SECURITY_TOKEN",
+      "aws --profile terraform-role --region ${var.region} --no-cli-pager",
+      "appstream update-stack --name ${aws_appstream_stack.main.name}",
+      "--attributes-to-delete STORAGE_CONNECTORS --output text --query Stack.Name",
+    ])
+  }
+}
+
 resource "aws_appstream_fleet_stack_association" "main" {
   fleet_name = aws_appstream_fleet.main.name
   stack_name = aws_appstream_stack.main.name
+
+  # The fleet keeps its name when replaced (e.g. fleet_type changes), so the
+  # association must be removed before the old fleet can be deleted.
+  lifecycle {
+    replace_triggered_by = [aws_appstream_fleet.main.arn]
+  }
 }
 
 resource "aws_appautoscaling_target" "fleet" {
@@ -190,6 +218,48 @@ resource "aws_appautoscaling_target" "fleet" {
   resource_id        = "fleet/${aws_appstream_fleet.main.name}"
   scalable_dimension = "appstream:fleet:DesiredCapacity"
   service_namespace  = "appstream"
+
+  # Scheduled actions own the minimum after creation.
+  lifecycle {
+    ignore_changes       = [min_capacity]
+    replace_triggered_by = [aws_appstream_fleet.main.arn]
+  }
+}
+
+resource "aws_appautoscaling_scheduled_action" "business_hours_start" {
+  name               = "business-hours-start-${local.name_suffix}"
+  service_namespace  = aws_appautoscaling_target.fleet.service_namespace
+  resource_id        = aws_appautoscaling_target.fleet.resource_id
+  scalable_dimension = aws_appautoscaling_target.fleet.scalable_dimension
+  schedule           = var.business_hours_start_schedule
+  timezone           = var.business_hours_timezone
+
+  scalable_target_action {
+    min_capacity = var.min_capacity
+    max_capacity = var.max_capacity
+  }
+
+  lifecycle {
+    replace_triggered_by = [aws_appautoscaling_target.fleet]
+  }
+}
+
+resource "aws_appautoscaling_scheduled_action" "business_hours_end" {
+  name               = "business-hours-end-${local.name_suffix}"
+  service_namespace  = aws_appautoscaling_target.fleet.service_namespace
+  resource_id        = aws_appautoscaling_target.fleet.resource_id
+  scalable_dimension = aws_appautoscaling_target.fleet.scalable_dimension
+  schedule           = var.business_hours_end_schedule
+  timezone           = var.business_hours_timezone
+
+  scalable_target_action {
+    min_capacity = 0
+    max_capacity = var.max_capacity
+  }
+
+  lifecycle {
+    replace_triggered_by = [aws_appautoscaling_target.fleet]
+  }
 }
 
 resource "aws_appautoscaling_policy" "scale_out" {
@@ -209,6 +279,10 @@ resource "aws_appautoscaling_policy" "scale_out" {
       scaling_adjustment          = 1
     }
   }
+
+  lifecycle {
+    replace_triggered_by = [aws_appautoscaling_target.fleet]
+  }
 }
 
 resource "aws_appautoscaling_policy" "scale_in" {
@@ -220,48 +294,185 @@ resource "aws_appautoscaling_policy" "scale_in" {
 
   step_scaling_policy_configuration {
     adjustment_type         = "ChangeInCapacity"
-    cooldown                = 900
+    cooldown                = 300
     metric_aggregation_type = "Average"
 
     step_adjustment {
-      metric_interval_upper_bound = 0
+      metric_interval_lower_bound = 0
       scaling_adjustment          = -1
     }
+  }
+
+  lifecycle {
+    replace_triggered_by = [aws_appautoscaling_target.fleet]
   }
 }
 
 resource "aws_cloudwatch_metric_alarm" "available_capacity" {
   alarm_name          = "appstream-available-${local.name_suffix}"
-  comparison_operator = "LessThanOrEqualToThreshold"
-  evaluation_periods  = 2
-  metric_name         = "AvailableCapacity"
-  namespace           = "AWS/AppStream"
-  period              = 60
-  statistic           = "Average"
-  threshold           = 3
-  alarm_description   = "Add an AppStream instance when three or fewer sessions are available."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  threshold           = 1
+  alarm_description   = "Add an AppStream instance while sessions are in use and one or fewer spare instances remain, or when a launch fails for lack of capacity."
   alarm_actions       = [aws_appautoscaling_policy.scale_out.arn]
   treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    Fleet = aws_appstream_fleet.main.name
+  # Gating on in-use sessions keeps the idle fleet at the single minimum spare
+  # instead of repeatedly scaling out and back in. Outside business hours the
+  # fleet may be empty, so a rejected launch adds one instance unless one is
+  # already being provisioned.
+  metric_query {
+    id          = "scale_out"
+    expression  = "IF((in_use >= 1 AND available <= 1) OR (FILL(insufficient, 0) >= 1 AND FILL(pending, 0) == 0), 1, 0)"
+    label       = "Scale out needed"
+    return_data = true
+  }
+
+  metric_query {
+    id = "available"
+
+    metric {
+      metric_name = "AvailableCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Minimum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
+  }
+
+  metric_query {
+    id = "in_use"
+
+    metric {
+      metric_name = "InUseCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Maximum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
+  }
+
+  metric_query {
+    id = "insufficient"
+
+    metric {
+      metric_name = "InsufficientCapacityError"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
+  }
+
+  metric_query {
+    id = "pending"
+
+    metric {
+      metric_name = "PendingCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Maximum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
   }
 }
 
-resource "aws_cloudwatch_metric_alarm" "capacity_utilization" {
-  alarm_name          = "appstream-utilization-${local.name_suffix}"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 15
-  metric_name         = "CapacityUtilization"
-  namespace           = "AWS/AppStream"
-  period              = 60
-  statistic           = "Average"
-  threshold           = 30
-  alarm_description   = "Remove an AppStream instance after utilization stays below 30% for 15 minutes."
+resource "aws_cloudwatch_metric_alarm" "idle_capacity" {
+  alarm_name          = "appstream-idle-${local.name_suffix}"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 5
+  threshold           = 1
+  alarm_description   = "Remove one idle AppStream instance after surplus spare capacity persists for five minutes."
   alarm_actions       = [aws_appautoscaling_policy.scale_in.arn]
   treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    Fleet = aws_appstream_fleet.main.name
+  # Thresholds are one above the scale-out condition so a scale-in never
+  # immediately re-triggers a scale-out.
+  metric_query {
+    id          = "scale_in"
+    expression  = "IF(available >= 3 OR (in_use == 0 AND available >= 2), 1, 0)"
+    label       = "Scale in allowed"
+    return_data = true
+  }
+
+  metric_query {
+    id = "available"
+
+    metric {
+      metric_name = "AvailableCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Minimum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
+  }
+
+  metric_query {
+    id = "in_use"
+
+    metric {
+      metric_name = "InUseCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Maximum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "unused_capacity" {
+  alarm_name          = "appstream-unused-${local.name_suffix}"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 30
+  threshold           = 1
+  alarm_description   = "Remove the last idle AppStream instance after 30 minutes without sessions; the business-hours minimum keeps one instance during the day."
+  alarm_actions       = [aws_appautoscaling_policy.scale_in.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "unused"
+    expression  = "IF(in_use == 0 AND available >= 1, 1, 0)"
+    label       = "Fleet unused"
+    return_data = true
+  }
+
+  metric_query {
+    id = "available"
+
+    metric {
+      metric_name = "AvailableCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Minimum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
+  }
+
+  metric_query {
+    id = "in_use"
+
+    metric {
+      metric_name = "InUseCapacity"
+      namespace   = "AWS/AppStream"
+      period      = 60
+      stat        = "Maximum"
+      dimensions = {
+        Fleet = aws_appstream_fleet.main.name
+      }
+    }
   }
 }

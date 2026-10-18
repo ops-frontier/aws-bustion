@@ -5,15 +5,64 @@ fleet and stack, capacity scaling alarms, and a GitHub OAuth launch service.
 Resource names include
 `bustion-${BUSTION_GITHUB_ORGANIZATION}`.
 
+## Linux fleet capacity
+
+The `ALWAYS_ON` fleet uses one Linux instance per session. The multi-session-only
+`max_sessions_per_instance` argument is intentionally omitted. Windows support
+is deferred; the existing Linux image and `stream.standard.xlarge` size remain.
+Always-On spare instances are already running, so sessions start without the
+On-Demand instance start-up delay, but idle instances incur running charges.
+
+Fleet type cannot change on a schedule, so business hours are implemented with
+Application Auto Scaling scheduled actions on the minimum capacity. By default
+the minimum is `min_capacity` (1) from 08:30 and 0 from 17:00 every day in
+`Asia/Tokyo` (`business_hours_start_schedule`, `business_hours_end_schedule`,
+`business_hours_timezone`). Because an empty Always-On fleet can take several
+minutes or more to provision its first instance, the minimum is raised 30
+minutes early so a running instance is ready by 09:00. Widen the lead time if
+provisioning is observed to take longer. Maximum capacity is 22 and initial
+capacity is 1, allowing 20 concurrent users plus spare capacity.
+
+Application Auto Scaling owns desired capacity and, after creation, the
+minimum capacity; Terraform ignores `desired_instances` and the scalable
+target's `min_capacity` so a later apply does not override the schedule.
+
+- Scale out by one when `InUseCapacity >= 1` and `AvailableCapacity <= 1`, or
+  when `InsufficientCapacityError >= 1` while `PendingCapacity == 0`, evaluated
+  with metric math over one one-minute period; the scale-out cooldown is 120
+  seconds. The capacity-error branch lets a rejected launch outside business
+  hours start one instance; the user retries after it is provisioned.
+- Scale in by one when `AvailableCapacity >= 3`, or `InUseCapacity == 0` and
+  `AvailableCapacity >= 2`, for five consecutive one-minute periods.
+- Scale in by one when `InUseCapacity == 0` and `AvailableCapacity >= 1` for 30
+  consecutive one-minute periods. During business hours the scheduled minimum
+  keeps the last instance; afterwards the fleet drains to zero.
+- The scale-in cooldown is 300 seconds. Scaling never goes below the current
+  scheduled minimum. Metric delivery, provisioning delays, and concurrent
+  arrivals can still temporarily exhaust capacity.
+
+Scale-in removes unused capacity without terminating active sessions. These
+waits are not user inactivity timeouts; session idle/disconnect timeout
+settings are unchanged. Ensure the regional AppStream instance quota permits
+the configured maximum.
+
+Changing `fleet_type` replaces the fleet under the same name. The stack
+association, scalable target, scheduled actions, and scaling policies use
+`replace_triggered_by` so they are recreated around the new fleet. Apply such a
+change when no sessions are active.
+
 ## Prerequisites
 
-- Terraform 1.6 or later, AWS provider 6.x, and Archive provider 2.x (>= 2.7).
+- Terraform 1.7 or later, AWS provider 6.x, and Archive provider 2.x (>= 2.7).
 - Python 3.10+ and AWS CLI v2 (installed by the Dev Container).
 - Codespaces secrets from the root README, including `BUSTION_GITHUB_ORGANIZATION`
   and `APPSTREAM_IMAGE_NAME`.
 - An already published AppStream image containing the required Linux desktop
   applications. Set its name in the uppercase `APPSTREAM_IMAGE_NAME` secret.
-- AWS permissions to create VPC, AppStream, IAM service roles and policy attachments,
+- An existing `AmazonAppStreamServiceAccess` service role (see below), which
+  this configuration reads but does not manage.
+- AWS permissions to create VPC, AppStream, `iam:GetRole` on the AppStream
+  service role,
   Application Auto Scaling, CloudWatch, API Gateway v2, Lambda, DynamoDB,
   Secrets Manager, and the Lambda execution role/policy, including `iam:PassRole`.
   Application Auto Scaling may also require `iam:CreateServiceLinkedRole` for
@@ -63,52 +112,28 @@ AppStream requires the ordinary IAM service role `AmazonAppStreamServiceAccess`,
 under the `/service-role/` IAM path, trusted by `appstream.amazonaws.com`,
 with the AWS managed policy
 `arn:aws:iam::aws:policy/service-role/AmazonAppStreamServiceAccess` attached.
-Terraform creates this role and waits for the policy attachment before creating
-the fleet and stack. The attachment is recreated when the role changes so that
-replacing a role with the same name also restores its managed policy.
-It is not a service-linked role: calling
-`CreateServiceLinkedRole` for `appstream.amazonaws.com` fails with
-`Cannot find Service Linked Role template`. Adding IAM permissions does not fix
-that error. The fleet's optional `iam_role_arn` is for streaming instance
-credentials and must not be used for this service role.
+It is not a service-linked role: calling `CreateServiceLinkedRole` for
+`appstream.amazonaws.com` fails with `Cannot find Service Linked Role template`.
+The fleet's optional `iam_role_arn` is for streaming instance credentials and
+must not be used for this service role.
 
-Before applying, check whether the account already has the role:
+This role is shared account-wide with other AppStream deployments, so this
+configuration **does not manage it**. Terraform only reads it with the
+`aws_iam_role` data source, fails the plan unless its path is `/service-role/`,
+and creates the fleet and stack after that lookup. `terraform destroy` never
+deletes the role or its policy attachment. Create and maintain them outside
+this configuration (for example, with the AppStream console or the account's
+shared IAM configuration).
 
-```sh
-aws iam get-role --role-name AmazonAppStreamServiceAccess --profile terraform-role
-```
+Earlier versions of this configuration created the role. The `removed` blocks
+in `main.tf` (`lifecycle { destroy = false }`, Terraform 1.7+) drop
+`aws_iam_role.appstream` and `aws_iam_role_policy_attachment.appstream` from an
+existing state without deleting them; the next plan reports that they
+"will no longer be managed by Terraform, but will not be destroyed". Keep the
+`removed` blocks until every state using this configuration has been applied.
+Do not run `terraform import` for these resources.
 
-Only `NoSuchEntity` means it is absent; resolve access or authentication errors
-before proceeding. If absent, Terraform creates it on the next apply. If present
-(for example, created by the AppStream console), import it from the `terraform`
-directory before planning:
-
-```sh
-terraform import aws_iam_role.appstream AmazonAppStreamServiceAccess
-terraform import aws_iam_role_policy_attachment.appstream \
-  AmazonAppStreamServiceAccess/arn:aws:iam::aws:policy/service-role/AmazonAppStreamServiceAccess
-```
-
-Import the attachment only if the managed policy is already attached; otherwise
-Terraform creates the attachment. Check with
-`aws iam list-attached-role-policies --role-name AmazonAppStreamServiceAccess --profile terraform-role`.
-This fixed-name role is shared account-wide. Do not import resources owned by
-another Terraform state; coordinate ownership with the account administrator.
-After import, review the plan for existing role changes, including its IAM path.
-Destroying this
-configuration also removes the managed role and attachment and can affect other
-AppStream deployments in the account.
-
-After the failed service-linked-role creation, run `terraform plan` and
-`terraform apply` again with this corrected configuration. Successfully created
-resources remain in state; no destroy or state removal is needed for the failed
-creation.
-
-### Recovering from `InvalidRoleException`
-
-If `CreateFleet` reports that
-`arn:aws:iam::<account-id>:role/service-role/AmazonAppStreamServiceAccess`
-is invalid, compare it with the actual role ARN and path:
+Before applying in a new account, check that the role exists:
 
 ```sh
 aws iam get-role --role-name AmazonAppStreamServiceAccess \
@@ -118,46 +143,31 @@ aws iam list-attached-role-policies \
   --role-name AmazonAppStreamServiceAccess --profile terraform-role
 ```
 
-A role at `arn:aws:iam::<account-id>:role/AmazonAppStreamServiceAccess`
-(path `/`) does not match the `/service-role/` ARN in this error.
-The configuration explicitly sets `path = "/service-role/"`.
-IAM paths cannot be updated in place, so correcting an existing root-path role
-requires replacing it. The plan must replace both `aws_iam_role.appstream` and
-`aws_iam_role_policy_attachment.appstream`, then create the failed fleet.
-The fixed role name prevents creating the replacement before deleting the old
-role; coordinate a maintenance window if other AppStream deployments use it.
-Do not proceed if the plan would unexpectedly replace other resources.
+If it is absent (`NoSuchEntity`), have the account administrator create it at
+path `/service-role/` with the trust policy and managed policy above. Terraform
+needs only `iam:GetRole` on it.
 
-From the `terraform` directory, review and apply the correction:
+### Recovering from `InvalidRoleException`
 
-```sh
-terraform plan
-terraform apply
-```
+If `CreateFleet` reports that
+`arn:aws:iam::<account-id>:role/service-role/AmazonAppStreamServiceAccess`
+is invalid, check the role with the commands above. A role at
+`arn:aws:iam::<account-id>:role/AmazonAppStreamServiceAccess` (path `/`)
+does not match, and this configuration's plan fails before creating the fleet.
+IAM paths cannot be updated in place; correcting the path requires the account
+administrator to recreate the shared role, which affects other AppStream
+deployments, so coordinate a maintenance window.
 
-Do not destroy the deployment or remove resources from state to recover.
 If the path, trust policy, and attachment are correct but the error persists
-immediately after role creation, allow a few minutes for IAM propagation and
-rerun `terraform plan` and `terraform apply`. The corrected role and attachment
-should no longer require replacement; stop and investigate if they do.
-Do not force another role replacement, as that restarts IAM propagation.
-`depends_on` waits for the IAM API operations to complete, not for AppStream
-to see those changes.
-
-AWS provider 6.69.1 has an additional retry limitation: its Fleet creation
-handler retries `InvalidRoleException` only when the message contains
-`encountered an error because your IAM role`. The message
-`encountered an error because your service role` does not match and fails
-without that propagation retry. See the
-[provider implementation](https://github.com/hashicorp/terraform-provider-aws/blob/v6.69.1/internal/service/appstream/fleet.go).
-Increasing SDK retry counts does not change this message filter.
-Waiting and rerunning the normal apply avoids recreating the already-correct
-role; it does not guarantee resolution if an authorization problem remains.
-
-If the error continues after propagation time, have the account administrator
-check the role's effective
-permissions, including any permissions boundary or organization policies.
-Do not set the fleet's `iam_role_arn` to work around this service-role error.
+immediately after the role was created or changed, allow a few minutes for IAM
+propagation and rerun `terraform plan` and `terraform apply`. AWS provider
+6.69.1's Fleet creation handler retries `InvalidRoleException` only when the
+message contains `encountered an error because your IAM role`; the message
+`encountered an error because your service role` fails without that retry. See
+the [provider implementation](https://github.com/hashicorp/terraform-provider-aws/blob/v6.69.1/internal/service/appstream/fleet.go).
+If the error continues, have the account administrator check the role's
+effective permissions, including any permissions boundary or organization
+policies. Do not set the fleet's `iam_role_arn` to work around this error.
 
 See the [AWS service role documentation](https://docs.aws.amazon.com/appstream2/latest/developerguide/controlling-access-checking-for-iam-service-access.html).
 
@@ -194,9 +204,19 @@ the configured stack/fleet. Lambda logs are retained for 30 days. Never log
 callback query strings, tokens, or streaming URLs. Secrets Manager uses its
 default recovery window on destroy; remove the GitHub OAuth App separately.
 
-The `HOMEFOLDERS` storage connector persists user home directories. AppStream
-application settings persistence is enabled for the stack; users' application
-settings are managed by AppStream storage.
+Home folders are disabled: the stack has no storage connectors, so nothing is
+persisted between sessions. The AWS provider does not apply storage connector
+removal to an existing stack, so `terraform_data.disable_home_folders` runs
+`aws appstream update-stack --attributes-to-delete STORAGE_CONNECTORS` with the
+`terraform-role` profile whenever the stack is created or replaced. Set
+`disable_home_folders_with_cli = false` to skip it (the tests do). Existing home
+folder data in the AppStream S3 bucket is not deleted.
+Application settings persistence is unsupported for Linux-based
+stacks and is explicitly disabled, including on existing stacks during updates.
+Enabling it causes `IncompatibleImageException` when associating the Linux fleet
+with the stack; rebuilding the Linux image does not enable this feature.
+See [AWS application settings persistence documentation](https://docs.aws.amazon.com/appstream2/latest/developerguide/app-settings-persistence.html)
+and [home folders](https://docs.aws.amazon.com/appstream2/latest/developerguide/home-folders.html).
 
 ## Local validation
 

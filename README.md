@@ -5,9 +5,9 @@ Terraform で Amazon AppStream 2.0 (WorkSpaces Applications) のネットワー�
 ## 現在の実装範囲
 
 - 2 つのプライベートサブネットを持つ VPC とリージョナル NAT Gateway
-- `stream.standard.xlarge`、1 インスタンスあたり最大 7 セッションのオンデマンド Fleet
-- AppStream Stack、ホームフォルダ保存、アプリケーション設定の永続化
-- 空きセッション数と稼働率に基づく Fleet のスケーリング
+- `stream.standard.xlarge`、1 インスタンスあたり 1 セッションの Linux Always-On Fleet
+- AppStream Stack（ホームフォルダ保存と、Linux 非対応のアプリケーション設定永続化は無効）
+- 毎日 9:00〜17:00（JST）に待機インスタンスを保ち、時間外は 0 台まで縮小する Fleet のスケーリング
 - API Gateway + Lambda による GitHub OAuth 認証、Organization メンバーシップ確認、AppStream 起動
 - Secrets Manager による OAuth 資格情報管理、DynamoDB による一回限りの OAuth state 管理
 - Codespaces 内の Python 3 / AWS CLI / Terraform と MFA ログインスクリプト
@@ -25,11 +25,11 @@ Terraform は公開済みの AppStream イメージを使用します。イメ�
 
 Cognito、OIDC ラッパー、SAML IdP は使用しません。`github_organization` に指定した Organization の有効なメンバー全員（非公開メンバーを含む）を許可し、招待待ち・非メンバーは拒否します。`read:org` scope のユーザートークンで本人のメンバーシップを確認するため、管理者の PAT は不要です。
 
-OAuth は PKCE（S256）と Secure / HttpOnly / SameSite=Lax Cookie に紐づく state で保護します。state は 10 分間有効で、DynamoDB の条件付き削除により一回だけ使用できます。GitHub のアクセストークンは Lambda の処理中だけ使用し、DB やログには保存しません。AppStream の UserId は変更可能な GitHub ログイン名ではなく `gh-<GitHub の数値 ID>` を使用し、ホームフォルダ等の識別子を安定させます。
+OAuth は PKCE（S256）と Secure / HttpOnly / SameSite=Lax Cookie に紐づく state で保護します。state は 10 分間有効で、DynamoDB の条件付き削除により一回だけ使用できます。GitHub のアクセストークンは Lambda の処理中だけ使用し、DB やログには保存しません。AppStream の UserId は変更可能な GitHub ログイン名ではなく `gh-<GitHub の数値 ID>` を使用し、利用者の識別子を安定させます。
 
 ## 必要な環境
 
-- Terraform 1.6 以降
+- Terraform 1.7 以降
 - Python 3.10 以降と AWS CLI v2（Dev Container にインストール済み）
 - AWS Provider 6.x
 - Archive Provider 2.7 以降（2.x、Lambda の ZIP 作成に使用）
@@ -79,12 +79,19 @@ Terraform state は現在ローカルに保存されます。Codespace を削除
 
 ## 注意事項
 
-- 最小容量 1、最大容量 4 の設定です。平日朝の事前起動スケジュールは未構成です。
+- Fleet は Always-On です。待機インスタンスは起動済みのため、接続は数十秒程度で始まりますが、未使用時も稼働料金がかかります。Fleet 種別は時刻で切り替えられないため、時間帯ごとの最小容量をスケジュールで変更します。
+- 既定では、9:00 に起動済みの1台が待機しているよう、30分前の 8:30 に最小容量を 1（`min_capacity`）へ上げ、17:00 に 0 へ下げます（`Asia/Tokyo`）。最大容量は 22、初期容量は 1 で、同時接続 20 人と待機分を想定しています。時刻は `business_hours_start_schedule` / `business_hours_end_schedule` / `business_hours_timezone` で変更できます。Windows 版は未実装です。
+- 0 台からの起動には数分〜十数分かかるため、開始時刻を 9:00 より早めています。実際の起動時間が30分を超える場合は、開始時刻をさらに早めてください。
+- 利用中のセッションがあり、空きが 1 台以下になった時点で 1 台追加します。空き 3 台以上、または利用中 0 で空き 2 台以上の状態が 5 分続くと 1 台削減します。スケールアウトのクールダウンは 120 秒、スケールインは 300 秒です。再 apply では自動調整後の容量を初期値に戻しません。
+- 利用中 0 で空きがある状態が 30 分続くと 1 台削減します。日中は最小容量 1 台が残り、17:00 以降は最後の 1 台も停止します。17:00 時点で使用中のセッションは強制終了しません。
+- 時間外（0 台）に接続すると容量不足で失敗しますが、その失敗（`InsufficientCapacityError`）を検知して 1 台起動します。数分〜十数分待ってから、もう一度ログイン URL を開いてください。起動中のインスタンスがある間は追加起動しません。
+- これらの待ち時間は未使用容量の縮小待ち時間であり、接続中ユーザーの無操作による切断タイムアウトではありません。使用中のセッションはスケールインで強制終了しません。
 - リージョナル NAT Gateway と AppStream の稼働には継続的な料金が発生します。不要時は `terraform destroy` で削除してください。
+- AppStream のサービスロール `AmazonAppStreamServiceAccess` は他の AppStream 環境と共用するため Terraform では管理せず、`terraform destroy` でも削除されません。事前に作成しておく必要があります（[AWS-SETUP.md](AWS-SETUP.md) を参照）。
 - 認証用の API Gateway、Lambda、DynamoDB、Secrets Manager、CloudWatch Logs にも料金が発生します。Lambda は VPC に接続せず、GitHub と AWS API にアクセスします。
-- `HOMEFOLDERS` は AppStream のホームフォルダストレージを有効にします。Stack のアプリケーション設定永続化も有効ですが、任意のファイルパスを個別指定する構成は含まれていません。
+- ホームフォルダ保存（`HOMEFOLDERS`）は無効です。セッション終了後、インスタンス上のファイルや Chrome / VS Code の設定は残りません。AWS provider はストレージコネクターの削除を反映しないため、apply 時に AWS CLI（`terraform-role` プロファイル）で既存 Stack から削除します。既存の S3 バケット内のデータは削除されません。Linux 非対応の Application Settings 永続化も明示的に無効にしています。
 - 起動 URL の有効期限は 60 秒です。URL 自体がアクセス権になるため、共有・ログ保存しないでください。この期限はセッションの最大利用時間ではありません。
 - Organization の利用権限は起動時に毎回確認します。メンバーを削除しても既存の AppStream セッションは即時終了しません。必要な場合は管理者がセッションを終了してください。
-- Fleet が停止中・容量不足・起動準備中の場合は接続できません。Fleet の稼働と公開イメージ内のアプリケーションを事前に確認してください。既存の `APP` stream view を維持し、起動 URL に特定の ApplicationId は指定しません。
+- Fleet が停止中・容量不足・起動準備中の場合は接続できません（時間外の自動起動は上記のとおりです）。Fleet の稼働と公開イメージ内のアプリケーションを事前に確認してください。既存の `APP` stream view を維持し、起動 URL に特定の ApplicationId は指定しません。
 - API Gateway は公開 HTTPS エンドポイントです。Organization の OAuth App 制限・SSO ポリシーによっては管理者承認が必要です。詳細は [GITHUB-SETUP.md](GITHUB-SETUP.md) を参照してください。
 - Secrets Manager の Secret は destroy 時に既定の復旧期間付きで削除予約されます。GitHub OAuth App の削除・失効は別途実施してください。
