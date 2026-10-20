@@ -14,6 +14,8 @@ Terraform で Amazon AppStream 2.0 (WorkSpaces Applications) のネットワー�
 
 Terraform は公開済みの AppStream イメージを使用します。イメージのビルド・公開処理は含まれていません。AppStream Image Builder で Chrome、VS Code、日本語環境を含むイメージを作成し、そのイメージ名を Codespaces Secret の `APPSTREAM_IMAGE_NAME` に設定してください。Packer の `amazon-ebs` が作成する EC2 AMI は AppStream イメージとして直接利用できません。
 
+具体的な手順は [IMAGE-BUILD.md](IMAGE-BUILD.md) を参照してください。Windows マルチセッション向けのイメージ作成、クライアント接続、USB パスキーの検証条件も記載しています。ただし、Windows マルチセッション用の Terraform / Lambda の変更は未実装であり、WorkSpaces Applications での WebAuthn 転送も対応確認が必要です。
+
 ## 認証・起動の流れ
 
 ```text
