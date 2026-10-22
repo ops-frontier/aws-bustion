@@ -4,6 +4,7 @@ import io
 import json
 import os
 import unittest
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -17,12 +18,63 @@ import github_auth as auth
 class StateStore:
     def __init__(self):
         self.items = {}
+        self.sessions = {}
+        self.users = {}
+
+    def table(self, name, key):
+        if name == "test-users":
+            return self.users
+        return self.sessions if key.startswith("session:") else self.items
 
     def put_item(self, **kwargs):
         if kwargs["ConditionExpression"] != "attribute_not_exists(state_id)":
             raise AssertionError("State creation must not overwrite an existing entry.")
         item = kwargs["Item"]
-        self.items[item["state_id"]["S"]] = item
+        key = item["state_id"]["S"]
+        self.table(kwargs["TableName"], key)[key] = item
+
+    def get_item(self, **kwargs):
+        key = next(iter(kwargs["Key"].values()))["S"]
+        item = self.table(kwargs["TableName"], key).get(key)
+        return {"Item": deepcopy(item)} if item else {}
+
+    def update_item(self, **kwargs):
+        key = next(iter(kwargs["Key"].values()))["S"]
+        item = self.table(kwargs["TableName"], key)[key]
+        values = kwargs["ExpressionAttributeValues"]
+        condition = kwargs.get("ConditionExpression", "")
+        if (
+            condition.startswith("attribute_not_exists(lease_until)")
+            and int(item.get("lease_until", {"N": "0"})["N"]) >= int(values[":now"]["N"])
+        ) or (
+            condition == "expires_at > :now"
+            and int(item.get("expires_at", {"N": "0"})["N"]) <= int(values[":now"]["N"])
+        ) or (condition == "lease = :lease" and item.get("lease") != values[":lease"]):
+            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+        expressions = kwargs["UpdateExpression"]
+        if expressions == "REMOVE lease, lease_until":
+            item.pop("lease", None)
+            item.pop("lease_until", None)
+        elif expressions == "REMOVE workspace_requested SET ad_ready = :ready":
+            item.pop("workspace_requested", None)
+            item["ad_ready"] = values[":ready"]
+        else:
+            for assignment in expressions.removeprefix("SET ").split(", "):
+                field, value = assignment.split(" = ")
+                item[field] = deepcopy(values[value])
+        return {}
+
+    def transact_write_items(self, **kwargs):
+        puts = [operation["Put"] for operation in kwargs["TransactItems"]]
+        if any(p["Item"]["principal"]["S"] in self.users for p in puts):
+            raise ClientError(
+                {"Error": {"Code": "TransactionCanceledException"},
+                 "CancellationReasons": [{"Code": "ConditionalCheckFailed"}]},
+                "TransactWriteItems",
+            )
+        for put in puts:
+            self.users[put["Item"]["principal"]["S"]] = deepcopy(put["Item"])
+        return {}
 
     def delete_item(self, **kwargs):
         if kwargs["ConditionExpression"] != "expires_at > :now":
@@ -39,7 +91,7 @@ class StateStore:
         return {"Attributes": self.items.pop(key)}
 
 
-class OAuthTests(unittest.TestCase):
+class AuthTestCase(unittest.TestCase):
     def setUp(self):
         self.environment = patch.dict(
             os.environ,
@@ -50,6 +102,9 @@ class OAuthTests(unittest.TestCase):
                 "STATE_TABLE": "test-state",
                 "APPSTREAM_STACK": "test-stack",
                 "APPSTREAM_FLEET": "test-fleet",
+                "USERS_TABLE": "test-users",
+                "DIRECTORY_ID": "d-1234567890",
+                "WORKSPACE_BUNDLE_ID": "wsb-96cqc2ksn",
             },
         )
         self.environment.start()
@@ -81,6 +136,15 @@ class OAuthTests(unittest.TestCase):
             "secretsmanager": self.secret,
             "appstream": self.appstream,
         }
+        self.ds_data = MagicMock()
+        self.ds = MagicMock()
+        self.workspaces = MagicMock()
+        self.clients.update({"ds-data": self.ds_data, "ds": self.ds, "workspaces": self.workspaces})
+        self.workspaces.describe_workspaces.return_value = {"Workspaces": []}
+        self.workspaces.create_workspaces.return_value = {
+            "PendingRequests": [{"WorkspaceId": "ws-123456789", "State": "PENDING"}],
+            "FailedRequests": [],
+        }
         client_patch = patch.object(auth, "aws_client", side_effect=self.clients.__getitem__)
         client_patch.start()
         self.addCleanup(client_patch.stop)
@@ -104,6 +168,24 @@ class OAuthTests(unittest.TestCase):
         }
         return result, params, event
 
+    def finish_linux(self, event):
+        result = auth.lambda_handler(event, None)
+        if result["statusCode"] != 302 or result["headers"]["Location"] != "/desktop":
+            return result
+        return auth.lambda_handler(self.session_event(result, "POST /linux"), None)
+
+    def session_event(self, callback, route, form=None):
+        cookie = next(c for c in callback["cookies"] if c.startswith(auth.SESSION_COOKIE + "="))
+        token = cookie.split(";", 1)[0].split("=", 1)[1]
+        session = self.state.sessions[auth.session_key(token)]
+        return {
+            "routeKey": route, "cookies": [cookie.split(";", 1)[0]],
+            "headers": {"origin": os.environ["BASE_URL"], "content-type": "application/x-www-form-urlencoded"},
+            "body": urlencode({"csrf": session["csrf"]["S"], **(form or {})}),
+        }
+
+
+class OAuthTests(AuthTestCase):
     def test_login_cookie_state_and_pkce(self):
         result, params, _ = self.begin()
         state = params["state"][0]
@@ -120,10 +202,56 @@ class OAuthTests(unittest.TestCase):
         self.assertEqual(result["headers"]["Cache-Control"], "no-store")
         self.appstream.create_streaming_url.assert_not_called()
 
+    def assert_centered_japanese_page(self, result):
+        self.assertEqual(result["headers"]["Content-Type"], "text/html; charset=utf-8")
+        self.assertEqual(result["headers"]["Cache-Control"], "no-store")
+        self.assertIn('<html lang="ja">', result["body"])
+        self.assertIn('name="viewport"', result["body"])
+        for rule in (
+            "min-height:100vh", "display:flex", "align-items:center",
+            "justify-content:center", "text-align:center",
+        ):
+            self.assertIn(rule, result["body"])
+        nonce = result["body"].split('<style nonce="', 1)[1].split('"', 1)[0]
+        self.assertEqual(
+            result["headers"]["Content-Security-Policy"],
+            f"default-src 'none'; style-src 'nonce-{nonce}'; frame-ancestors 'none'; "
+            "form-action 'self'; base-uri 'none'",
+        )
+
+    def test_session_ended_page_offers_login_without_starting_oauth(self):
+        result = auth.lambda_handler({"routeKey": "GET /session-ended"}, None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assert_centered_japanese_page(result)
+        self.assertIn(
+            '<main><h1>セッションを終了しました</h1>'
+            '<p><a href="/login">再度ログインする</a></p></main>',
+            result["body"],
+        )
+        self.assertNotIn("Location", result["headers"])
+        self.assertNotIn('http-equiv="refresh"', result["body"])
+        self.assertIn("Max-Age=0", result["cookies"][0])
+        self.secret.get_secret_value.assert_not_called()
+        self.github.assert_not_called()
+        self.appstream.create_streaming_url.assert_not_called()
+        self.assertEqual(self.state.items, {})
+
+    def test_fleet_warming_page_is_japanese_and_preserves_retry(self):
+        result = auth.fleet_warming_response()
+        self.assertEqual(result["statusCode"], 503)
+        self.assert_centered_japanese_page(result)
+        self.assertIn("<h1>接続用リソースを準備しています</h1>", result["body"])
+        self.assertIn("10〜20 分", result["body"])
+        self.assertIn("60 秒ごと", result["body"])
+        self.assertIn('<a href="/linux">もう一度確認する</a>', result["body"])
+        self.assertIn('http-equiv="refresh" content="60;url=/linux"', result["body"])
+        self.assertEqual(result["headers"]["Retry-After"], "60")
+        self.assertIn("Max-Age=0", result["cookies"][0])
+
     def test_active_member_launches_with_stable_id_and_60_second_url(self):
         _, _, event = self.begin()
         with self.assertLogs(auth.LOGGER, level="INFO") as logs:
-            result = auth.lambda_handler(event, None)
+            result = self.finish_linux(event)
         self.assertEqual(result["statusCode"], 302)
         self.assertEqual(result["headers"]["Location"], "https://stream.example.com/session")
         self.assertEqual(result["headers"]["Referrer-Policy"], "no-referrer")
@@ -162,7 +290,7 @@ class OAuthTests(unittest.TestCase):
             Desired=0, Available=0, Running=0
         )
         _, _, event = self.begin()
-        result = auth.lambda_handler(event, None)
+        result = self.finish_linux(event)
         self.appstream.describe_fleets.assert_called_once_with(Names=["test-fleet"])
         self.appstream.update_fleet.assert_called_once_with(
             Name="test-fleet", ComputeCapacity={"DesiredInstances": 1}
@@ -170,7 +298,7 @@ class OAuthTests(unittest.TestCase):
         self.appstream.create_streaming_url.assert_not_called()
         self.assertEqual(result["statusCode"], 503)
         self.assertEqual(result["headers"]["Retry-After"], "60")
-        self.assertIn('href="/login"', result["body"])
+        self.assertIn('href="/linux"', result["body"])
         self.assertIn('http-equiv="refresh"', result["body"])
         self.assertNotIn("Location", result["headers"])
         self.assertIn("Max-Age=0", result["cookies"][0])
@@ -181,7 +309,7 @@ class OAuthTests(unittest.TestCase):
             Desired=1, Available=0, Running=0
         )
         _, _, event = self.begin()
-        result = auth.lambda_handler(event, None)
+        result = self.finish_linux(event)
         self.assertEqual(result["statusCode"], 503)
         self.appstream.update_fleet.assert_not_called()
         self.appstream.create_streaming_url.assert_not_called()
@@ -200,10 +328,10 @@ class OAuthTests(unittest.TestCase):
             with self.subTest(available=available, expected_status=expected_status):
                 capacity["Available"] = available
                 self.github.side_effect = [
-                    {"access_token": "token"}, {"id": 123}, {"state": "active"}
+                    {"access_token": "token"}, {"id": 123, "login": "user123"}, {"state": "active"}
                 ]
                 _, _, event = self.begin()
-                result = auth.lambda_handler(event, None)
+                result = self.finish_linux(event)
                 self.assertEqual(result["statusCode"], expected_status)
                 if expected_status == 503:
                     self.assertEqual(
@@ -223,21 +351,34 @@ class OAuthTests(unittest.TestCase):
         ]
         capacity.update(Available=0, InUse=1)
         _, _, event = self.begin()
-        self.assertEqual(auth.lambda_handler(event, None)["statusCode"], 302)
+        self.assertEqual(self.finish_linux(event)["statusCode"], 302)
         self.appstream.update_fleet.assert_not_called()
         self.appstream.create_streaming_url.assert_called_once()
+
+    def test_linux_waiting_poll_resumes_without_oauth_or_selection(self):
+        _, _, event = self.begin()
+        callback = auth.lambda_handler(event, None)
+        capacity = self.appstream.describe_fleets.return_value["Fleets"][0]["ComputeCapacityStatus"]
+        capacity.update(Desired=1, Available=0, InUse=0)
+        result = auth.lambda_handler(self.session_event(callback, "POST /linux"), None)
+        self.assertEqual(result["statusCode"], 503)
+        self.assertIn('content="60;url=/linux"', result["body"])
+        capacity["Available"] = 1
+        result = auth.lambda_handler(self.session_event(callback, "GET /linux"), None)
+        self.assertEqual(result["headers"]["Location"], "https://stream.example.com/session")
+        self.assertEqual(self.github.call_count, 3)
 
     def test_missing_or_stopped_fleet_is_not_started(self):
         for fleets in ([], [{"State": "STOPPED"}], [{"State": "STARTING"}]):
             with self.subTest(fleets=fleets):
                 self.appstream.describe_fleets.return_value = {"Fleets": fleets}
                 self.github.side_effect = [
-                    {"access_token": "token"}, {"id": 123}, {"state": "active"}
+                    {"access_token": "token"}, {"id": 123, "login": "user123"}, {"state": "active"}
                 ]
                 _, _, event = self.begin()
-                result = auth.lambda_handler(event, None)
+                result = self.finish_linux(event)
                 self.assertEqual(result["statusCode"], 503)
-                self.assertIn("administrator", result["body"])
+                self.assertIn("管理者", result["body"])
                 self.assertNotIn("Retry-After", result["headers"])
         self.appstream.update_fleet.assert_not_called()
         self.appstream.create_streaming_url.assert_not_called()
@@ -255,11 +396,11 @@ class OAuthTests(unittest.TestCase):
                     operation,
                 )
                 self.github.side_effect = [
-                    {"access_token": "token"}, {"id": 123}, {"state": "active"}
+                    {"access_token": "token"}, {"id": 123, "login": "user123"}, {"state": "active"}
                 ]
                 _, _, event = self.begin()
                 with self.assertLogs(auth.LOGGER, level="ERROR") as logs:
-                    result = auth.lambda_handler(event, None)
+                    result = self.finish_linux(event)
                 self.assertEqual(result["statusCode"], 503)
                 self.assertNotIn("Retry-After", result["headers"])
                 self.assertNotIn("sensitive", " ".join(logs.output) + json.dumps(result))
@@ -276,7 +417,7 @@ class OAuthTests(unittest.TestCase):
 
     def test_state_cannot_be_replayed(self):
         _, _, event = self.begin()
-        self.assertEqual(auth.lambda_handler(event, None)["statusCode"], 302)
+        self.assertEqual(self.finish_linux(event)["statusCode"], 302)
         self.assertEqual(auth.lambda_handler(event, None)["statusCode"], 400)
         self.appstream.create_streaming_url.assert_called_once()
 
@@ -365,7 +506,7 @@ class OAuthTests(unittest.TestCase):
         self.appstream.create_streaming_url.side_effect = ClientError(
             {"Error": {"Code": "ResourceNotAvailableException"}}, "CreateStreamingURL"
         )
-        result = auth.lambda_handler(event, None)
+        result = self.finish_linux(event)
         self.assertEqual(result["statusCode"], 503)
         self.assertNotIn("Location", result["headers"])
         self.assertIn("Max-Age=0", result["cookies"][0])
@@ -375,6 +516,358 @@ class OAuthTests(unittest.TestCase):
             auth.lambda_handler({"routeKey": "POST /callback"}, None)["statusCode"], 404
         )
         self.secret.get_secret_value.assert_not_called()
+
+
+class WindowsTests(AuthTestCase):
+    def login(self, login="changeable-name", user_id=123456):
+        self.github.side_effect = [
+            {"access_token": "never-log-token"}, {"id": user_id, "login": login},
+            {"state": "active"},
+        ]
+        _, _, event = self.begin()
+        callback = auth.lambda_handler(event, None)
+        self.assertEqual(callback["headers"]["Location"], "/desktop")
+        return callback
+
+    def owned_user(self):
+        return {
+            "Enabled": True,
+            "OtherAttributes": {"Description": {"S": "bustion-github:123456"}},
+        }
+
+    def start(self, callback, password="ValidTestPassword!42"):
+        return auth.lambda_handler(
+            self.session_event(callback, "POST /windows", {"password": password, "confirm": password}),
+            None,
+        )
+
+    def registered(self, callback):
+        self.ds_data.describe_user.return_value = self.owned_user()
+        self.state.users.update({
+            "github:123456": {
+                "principal": {"S": "github:123456"}, "user_id": {"S": "123456"},
+                "login": {"S": "changeable-name"}, "ad_ready": {"BOOL": True},
+            },
+            "login:changeable-name": {
+                "principal": {"S": "login:changeable-name"}, "user_id": {"S": "123456"},
+            },
+        })
+
+    def missing_directory_user(self):
+        self.ds_data.describe_user.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException"}}, "DescribeUser"
+        )
+
+    def test_oauth_displays_choice_without_provisioning(self):
+        callback = self.login()
+        result = auth.lambda_handler(self.session_event(callback, "GET /desktop"), None)
+        self.assertEqual(result["statusCode"], 200)
+        for text in ("AWA Linux", "AWP Windows", auth.CLIENT_DOWNLOAD, 'action="/linux"', 'action="/windows"'):
+            self.assertIn(text, result["body"])
+        self.ds_data.create_user.assert_not_called()
+        self.workspaces.create_workspaces.assert_not_called()
+        self.appstream.create_streaming_url.assert_not_called()
+        self.assertNotIn("never-log", repr(self.state.sessions))
+
+    def test_new_user_is_prompted_without_creating_any_resource(self):
+        callback = self.login()
+        result = auth.lambda_handler(self.session_event(callback, "POST /windows"), None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn('type="password"', result["body"])
+        self.assertIn('name="confirm"', result["body"])
+        self.assertIn("変更しない", result["body"])
+        self.assertEqual(self.state.users, {})
+        self.ds_data.create_user.assert_not_called()
+
+    def test_first_registration_and_creation_then_poll_and_launch(self):
+        callback = self.login()
+        self.missing_directory_user()
+        with self.assertLogs(auth.LOGGER, level="INFO") as logs:
+            result = self.start(callback)
+        self.assertIn("準備しています", result["body"])
+        self.ds_data.create_user.assert_called_once_with(
+            DirectoryId="d-1234567890", SAMAccountName="changeable-name",
+            ClientToken="github-123456",
+            OtherAttributes={"description": {"S": "bustion-github:123456"}},
+        )
+        self.ds.reset_user_password.assert_called_once_with(
+            DirectoryId="d-1234567890", UserName="changeable-name",
+            NewPassword="ValidTestPassword!42",
+        )
+        request = self.workspaces.create_workspaces.call_args.kwargs["Workspaces"][0]
+        self.assertEqual(request["BundleId"], "wsb-96cqc2ksn")
+        self.assertEqual(request["WorkspaceProperties"], {
+            "Protocols": ["WSP"], "RunningMode": "AUTO_STOP",
+            "RunningModeAutoStopTimeoutInMinutes": 60,
+        })
+        self.assertNotIn("ValidTestPassword", repr(self.state.users) + repr(self.state.sessions) + repr(logs.output) + repr(result))
+        self.ds_data.describe_user.side_effect = None
+        self.ds_data.describe_user.return_value = self.owned_user()
+        poll = self.session_event(callback, "GET /windows")
+        auth.lambda_handler(poll, None)
+        self.workspaces.create_workspaces.assert_called_once()
+        self.workspaces.describe_workspaces.return_value = {
+            "Workspaces": [{"WorkspaceId": "ws-123456789", "State": "PENDING"}],
+        }
+        self.assertIn('content="30;url=/windows"', auth.lambda_handler(poll, None)["body"])
+        for state in ("AVAILABLE", "STOPPED"):
+            self.workspaces.describe_workspaces.return_value["Workspaces"][0]["State"] = state
+            self.workspaces.describe_workspace_directories.return_value = {
+                "Directories": [{"RegistrationCode": "WSnrt+ABC12D"}],
+            }
+            result = auth.lambda_handler(poll, None)
+            self.assertIn("workspaces://changeable-name@WSnrt%2BABC12D", result["body"])
+            self.assertIn(auth.CLIENT_DOWNLOAD, result["body"])
+        self.ds.reset_user_password.assert_called_once()
+
+    def test_bad_password_and_confirmation_are_not_forwarded(self):
+        callback = self.login()
+        for password, confirm in (
+            ("short", "short"), ("ValidTestPassword!42", "different"),
+            ("a" * 128, "a" * 128), ("CHANGEABLE-NAME42!", "CHANGEABLE-NAME42!"),
+        ):
+            event = self.session_event(callback, "POST /windows", {"password": password, "confirm": confirm})
+            self.assertEqual(auth.lambda_handler(event, None)["statusCode"], 400)
+        self.ds_data.create_user.assert_not_called()
+        self.ds.reset_user_password.assert_not_called()
+        self.workspaces.create_workspaces.assert_not_called()
+        self.assertEqual(self.state.users, {})
+
+    def test_password_policy_failure_can_be_retried_without_recreating_user(self):
+        callback = self.login()
+        self.ds_data.describe_user.return_value = self.owned_user()
+        self.ds.reset_user_password.side_effect = ClientError(
+            {"Error": {"Code": "InvalidPasswordException", "Message": "secret"}}, "ResetUserPassword",
+        )
+        result = self.start(callback)
+        self.assertEqual(result["statusCode"], 400)
+        self.assertNotIn("secret", result["body"])
+        self.workspaces.create_workspaces.assert_not_called()
+        self.ds.reset_user_password.side_effect = None
+        self.assertEqual(self.start(callback)["statusCode"], 200)
+        self.ds_data.create_user.assert_not_called()
+        self.assertTrue(self.state.users["github:123456"]["ad_ready"]["BOOL"])
+
+    def test_windows_username_constraints_do_not_block_linux(self):
+        for login in ("a" * 21, "Admin", "Administrator", "Guest", "krbtgt"):
+            callback = self.login(login)
+            result = auth.lambda_handler(self.session_event(callback, "POST /windows"), None)
+            self.assertEqual(result["statusCode"], 400)
+            self.assertEqual(auth.lambda_handler(self.session_event(callback, "POST /linux"), None)["statusCode"], 302)
+        self.assertEqual(self.state.users, {})
+        self.assertEqual(
+            auth.validate_windows_login({"login": {"S": "a" * 20}}), "a" * 20,
+        )
+
+    def test_renamed_or_reused_github_login_is_rejected(self):
+        callback = self.login()
+        self.registered(callback)
+        renamed = self.login("new-name")
+        self.assertEqual(self.start(renamed)["statusCode"], 403)
+        reused = self.login(user_id=987654)
+        self.assertEqual(self.start(reused)["statusCode"], 409)
+        self.workspaces.create_workspaces.assert_not_called()
+        self.ds.reset_user_password.assert_not_called()
+
+    def test_unmanaged_directory_user_is_never_adopted_or_reset(self):
+        callback = self.login()
+        self.ds_data.describe_user.return_value = {"OtherAttributes": {}, "Enabled": True}
+        self.assertEqual(self.start(callback)["statusCode"], 409)
+        self.ds.reset_user_password.assert_not_called()
+        self.workspaces.create_workspaces.assert_not_called()
+
+    def test_disabled_or_deleted_registered_user_is_not_reenabled(self):
+        callback = self.login()
+        self.registered(callback)
+        self.ds_data.describe_user.return_value["Enabled"] = False
+        self.assertEqual(self.start(callback)["statusCode"], 403)
+        self.missing_directory_user()
+        self.assertEqual(self.start(callback)["statusCode"], 403)
+        self.ds.reset_user_password.assert_not_called()
+
+    def test_concurrent_request_waits_instead_of_resetting_or_creating(self):
+        callback = self.login()
+        self.registered(callback)
+        self.state.users["github:123456"]["lease_until"] = {"N": str(int(auth.time.time()) + 60)}
+        result = self.start(callback)
+        self.assertIn("準備しています", result["body"])
+        self.ds.reset_user_password.assert_not_called()
+        self.workspaces.create_workspaces.assert_not_called()
+
+    def test_existing_workspace_does_not_trigger_creation_or_password_reset(self):
+        callback = self.login()
+        self.registered(callback)
+        self.workspaces.describe_workspaces.return_value = {
+            "Workspaces": [{"WorkspaceId": "ws-123456789", "State": "AVAILABLE"}],
+        }
+        self.workspaces.describe_workspace_directories.return_value = {
+            "Directories": [{"RegistrationCode": "WSnrt+ABC12D"}],
+        }
+        self.assertIn("workspaces://", self.start(callback)["body"])
+        self.ds.reset_user_password.assert_not_called()
+        self.workspaces.create_workspaces.assert_not_called()
+
+    def test_user_replication_delay_retries_only_after_explicit_rejection(self):
+        callback = self.login()
+        self.registered(callback)
+        self.workspaces.create_workspaces.return_value = {
+            "FailedRequests": [{"ErrorCode": "ResourceNotFound.User"}],
+        }
+        self.assertIn("準備しています", self.start(callback)["body"])
+        self.assertNotIn("workspace_requested", self.state.users["github:123456"])
+        self.workspaces.create_workspaces.return_value = {
+            "PendingRequests": [{"WorkspaceId": "ws-123456789"}],
+        }
+        auth.lambda_handler(self.session_event(callback, "GET /windows"), None)
+        self.assertEqual(self.workspaces.create_workspaces.call_count, 2)
+
+    def test_creation_rejection_is_an_error_and_is_not_retried(self):
+        callback = self.login()
+        self.registered(callback)
+        self.workspaces.create_workspaces.return_value = {
+            "FailedRequests": [{"ErrorCode": "ResourceLimitExceeded", "ErrorMessage": "sensitive"}],
+        }
+        self.assertEqual(self.start(callback)["statusCode"], 503)
+        result = auth.lambda_handler(self.session_event(callback, "GET /windows"), None)
+        self.assertEqual(result["statusCode"], 503)
+        self.assertNotIn("sensitive", result["body"])
+        self.workspaces.create_workspaces.assert_called_once()
+
+    def test_create_api_exception_remains_explicit_on_subsequent_requests(self):
+        callback = self.login()
+        self.registered(callback)
+        self.workspaces.create_workspaces.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "CreateWorkspaces",
+        )
+        self.assertEqual(self.start(callback)["statusCode"], 503)
+        self.assertEqual(
+            auth.lambda_handler(self.session_event(callback, "GET /windows"), None)["statusCode"], 503,
+        )
+        self.workspaces.create_workspaces.assert_called_once()
+
+    def test_uncertain_transport_result_does_not_duplicate_creation(self):
+        callback = self.login()
+        self.registered(callback)
+        self.workspaces.create_workspaces.side_effect = auth.BotoCoreError()
+        self.assertEqual(self.start(callback)["statusCode"], 503)
+        self.assertIn("workspace_requested", self.state.users["github:123456"])
+        auth.lambda_handler(self.session_event(callback, "GET /windows"), None)
+        self.workspaces.create_workspaces.assert_called_once()
+        self.state.users["github:123456"]["workspace_requested"] = {"N": "1"}
+        self.assertEqual(auth.lambda_handler(self.session_event(callback, "GET /windows"), None)["statusCode"], 503)
+
+    def test_workspace_failure_states_and_missing_registration_code_are_errors(self):
+        callback = self.login()
+        self.registered(callback)
+        for state in ("ERROR", "UNHEALTHY", "TERMINATED", "AVAILABLE"):
+            self.workspaces.describe_workspaces.return_value = {"Workspaces": [{"State": state}]}
+            self.workspaces.describe_workspace_directories.return_value = {"Directories": []}
+            self.assertEqual(self.start(callback)["statusCode"], 503)
+        self.workspaces.create_workspaces.assert_not_called()
+
+    def test_session_csrf_origin_and_form_validation(self):
+        callback = self.login()
+        valid = self.session_event(callback, "POST /windows")
+        for event in (
+            {**valid, "cookies": []},
+            {**valid, "headers": {**valid["headers"], "origin": "https://evil.example"}},
+            {**valid, "body": urlencode({"csrf": "wrong"})},
+            {**valid, "body": valid["body"] + "&csrf=second"},
+            {**valid, "body": "%invalid-base64", "isBase64Encoded": True},
+            {**valid, "body": "x" * 8193},
+        ):
+            self.assertIn(auth.lambda_handler(event, None)["statusCode"], (400, 403))
+        self.assertEqual(self.state.users, {})
+        session = next(iter(self.state.sessions.values()))
+        session["expires_at"] = {"N": "0"}
+        self.assertEqual(auth.lambda_handler(valid, None)["statusCode"], 403)
+
+    def test_form_pages_keep_origin_for_same_origin_posts(self):
+        callback = self.login()
+        page = auth.lambda_handler(self.session_event(callback, "GET /desktop"), None)
+        self.assertEqual(page["headers"]["Referrer-Policy"], "same-origin")
+        self.assertIn('action="/windows"', page["body"])
+        valid = self.session_event(callback, "POST /windows")
+        null_origin = {**valid, "headers": {**valid["headers"], "origin": "null"}}
+        self.assertEqual(auth.lambda_handler(null_origin, None)["statusCode"], 403)
+
+    def test_base64_form_is_accepted(self):
+        callback = self.login()
+        event = self.session_event(callback, "POST /windows")
+        event.update(body=base64.b64encode(event["body"].encode()).decode(), isBase64Encoded=True)
+        self.assertEqual(auth.lambda_handler(event, None)["statusCode"], 200)
+
+    def test_direct_get_does_not_provision_before_selecting_windows(self):
+        callback = self.login()
+        for route in ("GET /windows", "GET /linux"):
+            result = auth.lambda_handler(self.session_event(callback, route), None)
+            self.assertEqual(result["headers"]["Location"], "/desktop")
+        self.assertEqual(self.state.users, {})
+
+
+class WindowsApiTests(unittest.TestCase):
+    def client(self, service):
+        return auth.boto3.client(
+            service, region_name="ap-northeast-1",
+            aws_access_key_id="testing", aws_secret_access_key="testing",
+        )
+
+    def test_directory_registration_matches_sdk_models(self):
+        data, directory = self.client("ds-data"), self.client("ds")
+        session = {"user_id": {"S": "123456"}, "login": {"S": "test-user"}}
+        with (
+            Stubber(data) as data_stub, Stubber(directory) as directory_stub,
+            patch.object(auth, "aws_client", side_effect={"ds-data": data, "ds": directory}.__getitem__),
+            patch.object(auth, "update_user") as update,
+            patch.dict(os.environ, {"DIRECTORY_ID": "d-1234567890"}),
+        ):
+            data_stub.add_client_error(
+                "describe_user", service_error_code="ResourceNotFoundException",
+                expected_params={"DirectoryId": "d-1234567890", "SAMAccountName": "test-user", "OtherAttributes": ["description"]},
+            )
+            data_stub.add_response(
+                "create_user", {"SID": "S-1-5-21-1234567890-1234567890-1234567890-1001"},
+                {"DirectoryId": "d-1234567890", "SAMAccountName": "test-user", "ClientToken": "github-123456",
+                 "OtherAttributes": {"description": {"S": "bustion-github:123456"}}},
+            )
+            directory_stub.add_response(
+                "reset_user_password", {},
+                {"DirectoryId": "d-1234567890", "UserName": "test-user", "NewPassword": "ValidPassword!42"},
+            )
+            self.assertIsNone(auth.register_directory_user(session, {"password": "ValidPassword!42", "confirm": "ValidPassword!42"}))
+            update.assert_called_once_with(session, "SET ad_ready = :ready", {":ready": {"BOOL": True}})
+            data_stub.assert_no_pending_responses()
+            directory_stub.assert_no_pending_responses()
+
+    def test_workspace_request_matches_sdk_models(self):
+        client = self.client("workspaces")
+        session = {"user_id": {"S": "123456"}, "login": {"S": "test-user"}}
+        request = {
+            "DirectoryId": "d-1234567890", "UserName": "test-user",
+            "BundleId": "wsb-96cqc2ksn",
+            "WorkspaceProperties": {
+                "Protocols": ["WSP"], "RunningMode": "AUTO_STOP",
+                "RunningModeAutoStopTimeoutInMinutes": 60,
+            },
+            "Tags": [{"Key": "GitHubUserId", "Value": "123456"}],
+        }
+        with (
+            Stubber(client) as stub, patch.object(auth, "aws_client", return_value=client),
+            patch.object(auth, "update_user"), patch.dict(os.environ, {
+                "DIRECTORY_ID": "d-1234567890", "WORKSPACE_BUNDLE_ID": "wsb-96cqc2ksn",
+            }),
+        ):
+            stub.add_response(
+                "describe_workspaces", {"Workspaces": []},
+                {"DirectoryId": "d-1234567890", "UserName": "test-user"},
+            )
+            stub.add_response(
+                "create_workspaces",
+                {"FailedRequests": [], "PendingRequests": [{"WorkspaceId": "ws-123456789", "State": "PENDING"}]},
+                {"Workspaces": [request]},
+            )
+            self.assertIn("準備しています", auth.workspace_response(session, {})["body"])
+            stub.assert_no_pending_responses()
 
 
 class FleetApiTests(unittest.TestCase):

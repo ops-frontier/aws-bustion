@@ -1,6 +1,6 @@
 # GitHub OAuth App の準備
 
-このリポジトリは API Gateway + Lambda で GitHub OAuth を処理し、指定 Organization の有効なメンバーにだけ AppStream 起動 URL を発行します。Cognito、OIDC ラッパー、SAML IdP、管理者の PAT は不要です。
+このリポジトリは API Gateway + Lambda で GitHub OAuth を処理し、指定 Organization の有効なメンバーにだけ Linux / Windows の端末選択画面を表示します。Cognito、OIDC ラッパー、SAML IdP、管理者の PAT は不要です。
 
 ## 1. Terraform で callback 先を作成する
 
@@ -80,23 +80,25 @@ Lambda はログインごとに最新の Secret を読み取るため、値の�
 ## 5. 動作確認
 
 1. `appstream_login_url` をブラウザーで開き、GitHub にログインして認可します。
-2. 対象 Organization の有効なメンバーなら AppStream にリダイレクトされることを確認します。Fleet が稼働し、容量とアプリケーションが利用可能である必要があります。
+2. 対象 Organization の有効なメンバーなら端末選択画面が表示され、AWA Linux を選ぶと AppStream にリダイレクトされることを確認します。Fleet が稼働し、容量とアプリケーションが利用可能である必要があります。AWP Windows の確認は [WINDOWS-AWP.md](WINDOWS-AWP.md#実機確認) を参照してください。
 3. 別のブラウザープロファイル等を使い、非メンバーでは起動できないことを確認します。
 4. 使用済み callback URL の再送や、Cookie のないブラウザーでの callback 呼び出しが 400 になることを確認します。
-5. 時間外に利用者がいなくなり Fleet が 0 台になったら、有効なメンバーでログインします。待機画面になり、Fleet の Desired capacity が 1 になることを確認します。準備中に「Check again」を押しても要求台数が増えず、通常 10〜20 分後に空きができるとログイン経由の自動再確認で AppStream に進むことを確認します。AppStream の Retry や使用済み callback の再読み込みは使用しません。
+5. 時間外に利用者がいなくなり Fleet が 0 台になったら、有効なメンバーでログインして AWA Linux を選びます。日本語の待機画面が画面中央に表示され、Fleet の Desired capacity が 1 になることを確認します。準備中に「もう一度確認する」を押しても要求台数が増えず、通常 10〜20 分後に空きができると `/linux` の自動再確認で AppStream に進むことを確認します。AppStream の Retry や使用済み callback の再読み込みは使用しません。
 6. 0 台の状態で非メンバーのログインが Fleet を起動しないこと、セッション終了後に時間外の 30 分の無利用で再び 0 台まで縮小することも確認します。これらの確認では実際のインスタンス料金が発生します。
+7. AppStream の **End Session** を実行し、`/session-ended` に遷移して「セッションを終了しました」と「再度ログインする」の 2 行が画面中央に表示されることを確認します。「再度ログインする」を押すと `/login` から GitHub 認証を開始します。GitHub 自体からはログアウトしません。
 
-エラー時は Lambda の CloudWatch Logs（`/aws/lambda/github-auth-bustion-<Organization>`）を確認してください。エラーコードを記録し、GitHub のコード・トークン・Client Secret・AppStream 起動 URL は記録しません。API Gateway のリクエスト URL 全体や Lambda イベント全体を追加でログに出さないでください。
+エラー時は Lambda の CloudWatch Logs（`/aws/lambda/github-auth-bustion-<Organization>`）を確認してください。エラーコードを記録し、GitHub のコード・トークン・Client Secret・AppStream 起動 URL・Windows のパスワードは記録しません。API Gateway のリクエスト URL 全体、POST 本文、Lambda イベント全体を追加でログに出さないでください。
 
 | 応答 | 主な原因 |
 | --- | --- |
 | 400 | state の不一致・10 分の期限切れ・再使用、認可キャンセル、コード交換失敗 |
-| 403 | 非メンバー、招待待ち |
+| 403 | 非メンバー、招待待ち、ブラウザーセッション期限切れ、CSRF / Origin 不一致、Windows 登録後のユーザー名変更 |
+| 409 | Windows ユーザー名の衝突、所有者を確認できない AD ユーザー |
 | 502 | GitHub API の障害・アクセス制限・不正な応答 |
-| 503 | 起動準備中（待機画面・60 秒ごとに再認証）、Secret 未登録・形式不備、AWS 権限不足、Fleet / 起動処理が利用不能 |
+| 503 | Linux 起動準備中（待機画面・60 秒ごとに再確認）、Secret 未登録・形式不備、AWS 権限不足、Fleet / 起動処理が利用不能 |
 
 ## 6. トークン管理と失効
 
 GitHub のアクセストークンは本人・メンバーシップ確認にだけ使用し、Lambda の処理後に永続保存しません。リフレッシュトークンによる継続利用もしません。ただし保存しないことと GitHub 側で失効することは別です。利用を取り消す場合は、GitHub の **Settings → Applications → Authorized OAuth Apps** から認可を取り消してください。
 
-Client Secret が漏えいした場合は GitHub 側で再発行し、Secrets Manager の値を更新した後、古い Secret を失効させます。OAuth App を削除しても開始済みの AppStream セッションは終了しません。Organization からの削除も次回起動から反映されるため、即時遮断が必要なら AppStream 側でセッションを終了してください。
+Client Secret が漏えいした場合は GitHub 側で再発行し、Secrets Manager の値を更新した後、古い Secret を失効させます。OAuth App を削除しても開始済みのセッションは終了しません。Organization からの削除は次回 OAuth ログインから反映されます。認証後のブラウザーセッションは最大 1 時間有効で、既存の WorkSpaces クライアント接続は AD 認証です。即時遮断が必要ならポータルのセッション失効と、AppStream セッション終了または AD ユーザーの無効化なども管理者が実施してください。

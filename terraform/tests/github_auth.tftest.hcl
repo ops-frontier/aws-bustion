@@ -59,6 +59,8 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "random" {}
+
 variables {
   # Keep the local-exec provisioner from calling the real AppStream API.
   disable_home_folders_with_cli = false
@@ -204,8 +206,66 @@ run "github_launch_service" {
   }
 
   assert {
-    condition     = toset(keys(aws_apigatewayv2_route.github_auth)) == toset(["GET /", "GET /login", "GET /callback"])
-    error_message = "Only the expected login and callback routes should be exposed."
+    condition     = toset(keys(aws_apigatewayv2_route.github_auth)) == toset(["GET /", "GET /login", "GET /callback", "GET /session-ended", "GET /desktop", "POST /linux", "GET /linux", "POST /windows", "GET /windows"])
+    error_message = "Only the expected login, callback, and session-ended routes should be exposed."
+  }
+
+  assert {
+    condition = (
+      aws_directory_service_directory.windows.name == "example-org.bustion.ops-frontier.dev" &&
+      aws_directory_service_directory.windows.type == "MicrosoftAD" &&
+      aws_directory_service_directory.windows.edition == "Standard" &&
+      aws_directory_service_directory.windows.enable_directory_data_access &&
+      aws_directory_service_directory.windows.vpc_settings[0].vpc_id == aws_vpc.main.id &&
+      toset(aws_directory_service_directory.windows.vpc_settings[0].subnet_ids) == toset([for subnet in aws_subnet.private : subnet.id])
+    )
+    error_message = "Windows must use Standard Managed Microsoft AD with data access in the shared VPC/subnets."
+  }
+
+  assert {
+    condition = (
+      aws_workspaces_directory.windows.directory_id == aws_directory_service_directory.windows.id &&
+      aws_workspaces_directory.windows.workspace_creation_properties[0].enable_internet_access == false &&
+      aws_workspaces_directory.windows.workspace_creation_properties[0].user_enabled_as_local_administrator == false &&
+      aws_workspaces_directory.windows.self_service_permissions[0].switch_running_mode == false
+    )
+    error_message = "WorkSpaces must register the shared AD and retain private networking and AutoStop billing."
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.github_auth.environment[0].variables.DIRECTORY_ID == aws_workspaces_directory.windows.id &&
+      aws_lambda_function.github_auth.environment[0].variables.USERS_TABLE == aws_dynamodb_table.windows_users.name &&
+      aws_lambda_function.github_auth.environment[0].variables.WORKSPACE_BUNDLE_ID == "wsb-96cqc2ksn" &&
+      aws_dynamodb_table.windows_users.point_in_time_recovery[0].enabled &&
+      length(aws_dynamodb_table.windows_users.ttl) == 0 &&
+      random_password.directory_admin.length == 32
+    )
+    error_message = "Provisioning must use the specified bundle and durable identity bindings, with a generated administrator password."
+  }
+
+  assert {
+    condition = (
+      !contains(flatten([for statement in jsondecode(aws_iam_role_policy.github_auth.policy).Statement : statement.Action]), "workspaces:TerminateWorkspaces") &&
+      !contains(flatten([for statement in jsondecode(aws_iam_role_policy.github_auth.policy).Statement : statement.Action]), "ds-data:DeleteUser")
+    )
+    error_message = "The shared Lambda must not be permitted to delete user data."
+  }
+
+  assert {
+    condition = (
+      contains(
+        one([for statement in jsondecode(aws_iam_role_policy.github_auth.policy).Statement : statement.Resource if contains(statement.Action, "workspaces:CreateWorkspaces")]),
+        "arn:aws:workspaces:${var.region}:*:workspacebundle/wsb-96cqc2ksn"
+      ) &&
+      one([for statement in jsondecode(aws_iam_role_policy.github_auth.policy).Statement : statement.Resource if contains(statement.Action, "workspaces:CreateTags")]) == "*"
+    )
+    error_message = "Workspace creation must authorize the public bundle; CreateTags does not support resource-level permissions."
+  }
+
+  assert {
+    condition     = aws_appstream_stack.main.redirect_url == "${aws_apigatewayv2_api.github_auth.api_endpoint}/session-ended"
+    error_message = "End Session must redirect to the session-ended page on the deployed API."
   }
 
   assert {

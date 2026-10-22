@@ -45,3 +45,9 @@ touch "$HOME/.bashrc"
 if ! grep -Fxq "$source_line" "$HOME/.bashrc"; then
   printf '\n%s\n' "$source_line" >> "$HOME/.bashrc"
 fi
+
+# for eMudhra Intermediate CA Compromise
+sudo sed -i \
+-e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+-e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
+/etc/ca-certificates.conf && sudo update-ca-certificates

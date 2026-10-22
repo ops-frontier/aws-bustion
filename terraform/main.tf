@@ -152,7 +152,7 @@ resource "aws_appstream_stack" "main" {
   name         = "stack-${local.name_suffix}"
   description  = "Linux developer bastion for ${var.github_organization}."
   feedback_url = "https://github.com/${var.github_organization}"
-  redirect_url = "https://github.com/${var.github_organization}"
+  redirect_url = "${aws_apigatewayv2_api.github_auth.api_endpoint}/session-ended"
 
   application_settings {
     enabled = false

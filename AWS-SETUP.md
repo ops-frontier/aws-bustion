@@ -36,7 +36,15 @@ IAM でロールを作成し、信頼ポリシーの Principal を前項の IAM 
 
 GitHub 認証サービス用に API Gateway v2、Lambda、DynamoDB、Secrets Manager、CloudWatch Logs と Lambda 実行ロール / インラインポリシーの作成・更新・削除権限、およびそのロールを Lambda に渡す `iam:PassRole` も必要です。OAuth 資格情報を登録する作業者には、Terraform が作成した Secret に限定した `secretsmanager:PutSecretValue` を許可してください。Secret の値は Terraform で管理しません。
 
+WorkSpaces Personal 用に、Directory Service のディレクトリ作成・削除・Directory Service Data 有効化、WorkSpaces のディレクトリ登録・解除、および共通サービスロールの `iam:GetRole` 権限も必要です。Windows の AD 管理者パスワードは Random Provider で生成され、Terraform state に含まれます。state とバックアップを厳重に管理してください。
+
 IAM ユーザー側には、作成したロール ARN に対する `sts:AssumeRole` を許可します。信頼ポリシーとユーザーの許可ポリシーの両方が必要です。
+
+### WorkSpaces Personal の共通サービスロール
+
+Terraform 実行前に、アカウント共通の `workspaces_DefaultRole` を用意してください。WorkSpaces コンソールの初回設定、または共通 IAM 管理で作成します。信頼するサービスは `workspaces.amazonaws.com` で、AWS 管理ポリシー `AmazonWorkSpacesServiceAccess` と `AmazonWorkSpacesSelfServiceAccess` をアタッチします。
+
+このリポジトリはロールの存在を読み取り、他の WorkSpaces 環境に影響しないよう作成・変更・削除しません。既にある場合は再作成不要です。未作成の場合は plan が失敗します。
 
 ## 3. Codespaces Secrets
 

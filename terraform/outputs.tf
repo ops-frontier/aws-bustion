@@ -24,8 +24,18 @@ output "aws_account_id" {
 }
 
 output "appstream_login_url" {
-  description = "Open this URL to authenticate with GitHub and launch AppStream."
+  description = "Shared GitHub login URL for Linux Applications and Windows Personal."
   value       = "${aws_apigatewayv2_api.github_auth.api_endpoint}/login"
+}
+
+output "workspaces_directory_id" {
+  description = "Managed Microsoft AD directory registered with WorkSpaces Personal."
+  value       = aws_workspaces_directory.windows.id
+}
+
+output "workspaces_registration_code" {
+  description = "WorkSpaces Personal client registration code."
+  value       = aws_workspaces_directory.windows.registration_code
 }
 
 output "github_oauth_callback_url" {

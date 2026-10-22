@@ -1,15 +1,17 @@
 # Terraform
 
 This configuration creates the private VPC, regional NAT gateway, AppStream
-fleet and stack, capacity scaling alarms, and a GitHub OAuth launch service.
+fleet and stack, capacity scaling alarms, a Managed Microsoft AD directory
+registered with WorkSpaces Personal, and a shared GitHub OAuth launch service.
 Resource names include
 `bustion-${BUSTION_GITHUB_ORGANIZATION}`.
 
 ## Linux fleet capacity
 
 The `ALWAYS_ON` fleet uses one Linux instance per session. The multi-session-only
-`max_sessions_per_instance` argument is intentionally omitted. Windows support
-is deferred; the existing Linux image and `stream.standard.xlarge` size remain.
+`max_sessions_per_instance` argument is intentionally omitted. The existing
+Linux image and `stream.standard.xlarge` size remain unchanged. Windows uses
+WorkSpaces Personal, not this fleet; see [WINDOWS-AWP.md](../WINDOWS-AWP.md#実装と導入).
 Always-On spare instances are already running, so sessions start without the
 On-Demand instance start-up delay, but idle instances incur running charges.
 
@@ -25,15 +27,15 @@ capacity is 1, allowing 20 concurrent users plus spare capacity.
 
 Application Auto Scaling manages desired capacity and, after creation, the
 minimum capacity. After GitHub membership verification, the launch Lambda also
-requests `DesiredInstances = 1` if desired capacity and in-use capacity are both
+requests `DesiredInstances = 1` after Linux is selected if desired capacity and in-use capacity are both
 zero. Terraform ignores `desired_instances` and the scalable target's
 `min_capacity` so a later apply does not override scaling or the schedule.
 
 This explicit wake-up does not depend on a rejected AppStream session or
 CloudWatch metric delivery. While there are neither active sessions nor available
 instances, the Lambda returns a waiting page (HTTP 503, `Retry-After: 60`) instead
-of creating a short-lived streaming URL. The page returns to `/login` every 60
-seconds, rechecking GitHub membership and capacity with a fresh OAuth state.
+of creating a short-lived streaming URL. The page returns to `/linux` every 60
+seconds, rechecking capacity within the authenticated browser session.
 Users can also select "Check again"; refreshing a consumed `/callback` or
 pressing AppStream Retry is not the recovery path. Provisioning usually takes
 10-20 minutes. A nonzero desired capacity prevents repeated wake-up requests.
@@ -71,7 +73,8 @@ change when no sessions are active.
 
 ## Prerequisites
 
-- Terraform 1.7 or later, AWS provider 6.x, and Archive provider 2.x (>= 2.7).
+- Terraform 1.7 or later, AWS provider 6.x, Archive provider 2.x (>= 2.7),
+  and Random provider 3.x (>= 3.7).
 - Python 3.10+ and AWS CLI v2 (installed by the Dev Container).
 - Codespaces secrets from the root README, including `BUSTION_GITHUB_ORGANIZATION`
   and `APPSTREAM_IMAGE_NAME`.
@@ -79,6 +82,8 @@ change when no sessions are active.
   applications. Set its name in the uppercase `APPSTREAM_IMAGE_NAME` secret.
 - An existing `AmazonAppStreamServiceAccess` service role (see below), which
   this configuration reads but does not manage.
+- An existing `workspaces_DefaultRole` with the WorkSpaces service and self-service
+  policies, trusted by `workspaces.amazonaws.com`; see [AWS-SETUP.md](../AWS-SETUP.md#workspaces-personal-の共通サービスロール).
 - AWS permissions to create VPC, AppStream, `iam:GetRole` on the AppStream
   service role,
   Application Auto Scaling, CloudWatch, API Gateway v2, Lambda, DynamoDB,
@@ -86,6 +91,8 @@ change when no sessions are active.
   Application Auto Scaling may also require `iam:CreateServiceLinkedRole` for
   `appstream.application-autoscaling.amazonaws.com` on first use.
   Credential registration also requires `secretsmanager:PutSecretValue`.
+- Directory Service create/delete and data-access configuration, and WorkSpaces
+  directory registration/deregistration permissions.
 
 The workspace creates a `base` credentials profile and a `terraform-mfa`
 configuration profile using the supplied source access key, role ARN, and MFA
@@ -196,11 +203,15 @@ Packer's `amazon-ebs` builder creates an EC2 AMI and cannot publish it as an
 AppStream image. Build and publish the AppStream image with an AppStream Image
 Builder workflow before applying this configuration.
 
-The public HTTP API exposes `GET /`, `GET /login`, and `GET /callback`.
+The public HTTP API exposes `GET /`, `/login`, `/callback`, `/session-ended`,
+`/desktop`, `/linux`, `/windows`, and `POST /linux` and `/windows`.
 The Python 3.13 Lambda runs outside the VPC and uses GitHub OAuth with PKCE
 and browser-bound, single-use state (10-minute expiry). DynamoDB conditional
 deletion enforces expiry and prevents replay independently of TTL cleanup.
-Only active members of `github_organization` may launch AppStream.
+Only active members of `github_organization` may obtain a browser session.
+OAuth redirects to `/desktop` to choose AWA Linux or AWP Windows. Sessions
+expire after one hour, store only a hash of the random cookie token, and use
+CSRF tokens plus same-origin POST validation. Tokens from GitHub are never saved.
 
 After applying, follow [GITHUB-SETUP.md](../GITHUB-SETUP.md) to register an OAuth
 App with the callback output and populate the secret output with
@@ -209,16 +220,18 @@ container, never its value. Sign-in returns 503 until credentials are configured
 No Cognito, OIDC wrapper, SAML federation, or AppStream user-pool assignments
 are required.
 
-Lambda verifies the authenticated user's organization membership on every
-launch, calls `CreateStreamingURL` with a 60-second validity and stable
+Lambda verifies the authenticated user's organization membership at OAuth
+login. Selecting Linux calls `CreateStreamingURL` with a 60-second validity and stable
 `gh-<numeric GitHub ID>` user ID, and redirects the browser to that URL.
 The existing `APP` stream view is unchanged; no `ApplicationId` is specified.
 GitHub tokens are not persisted, and removing organization membership does
 not terminate existing AppStream sessions.
 
-The execution role can only read the dedicated secret, put/delete state in
-the dedicated table, write its Lambda logs, and create streaming URLs for
-the configured stack/fleet. Lambda logs are retained for 30 days. Never log
+The execution role reads the OAuth secret, manages state/sessions and identity
+bindings in the dedicated DynamoDB tables, writes its logs, inspects/wakes the
+Linux fleet, and creates its streaming URLs. It can also create/describe users
+and reset initial passwords only in the new AD directory, and create/tag
+WorkSpaces. It cannot delete AD users or WorkSpaces. Lambda logs are retained for 30 days. Never log
 callback query strings, tokens, or streaming URLs. Secrets Manager uses its
 default recovery window on destroy; remove the GitHub OAuth App separately.
 
@@ -258,5 +271,5 @@ python3 -m unittest discover -s lambda -p 'test_*.py' -v
 The Terraform mock-provider test requires Terraform 1.7+ and makes no AWS calls.
 The Lambda tests require Python 3.10+ and `boto3` locally; the deployed runtime
 includes the AWS SDK. They mock AWS and GitHub and do not launch real sessions.
-Complete the browser-based checks in [GITHUB-SETUP.md](../GITHUB-SETUP.md) after
-deployment.
+Complete the browser-based checks in [GITHUB-SETUP.md](../GITHUB-SETUP.md) and
+[WINDOWS-AWP.md](../WINDOWS-AWP.md#実機確認) after deployment.
