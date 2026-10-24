@@ -33,8 +33,8 @@ zero. Terraform ignores `desired_instances` and the scalable target's
 
 This explicit wake-up does not depend on a rejected AppStream session or
 CloudWatch metric delivery. While there are neither active sessions nor available
-instances, the Lambda returns a waiting page (HTTP 503, `Retry-After: 60`) instead
-of creating a short-lived streaming URL. The page returns to `/linux` every 60
+instances, the Lambda returns a waiting page (HTTP 503, `Retry-After: 20`) instead
+of creating a short-lived streaming URL. The page returns to `/linux` every 20
 seconds, rechecking capacity within the authenticated browser session.
 Users can also select "Check again"; refreshing a consumed `/callback` or
 pressing AppStream Retry is not the recovery path. Provisioning usually takes
@@ -205,13 +205,31 @@ Builder workflow before applying this configuration.
 
 The public HTTP API exposes `GET /`, `/login`, `/callback`, `/session-ended`,
 `/desktop`, `/linux`, `/windows`, and `POST /linux` and `/windows`.
+All Lambda HTML pages share a header with a left-aligned ops-frontier logo
+and the horizontally centered title "ゼロトラスト仮想化端末サービス".
+On narrow screens the title moves below the logo to avoid overlap.
+The favicon and logo are served without authentication at `GET /favicon.ico`
+and `GET /ops-frontier-logo.svg`. Both assets in `lambda/` are packaged with
+the Python handler; tests and bytecode caches are excluded from the ZIP.
+Apply Terraform to deploy the HTML, assets, and API routes together.
 The Python 3.13 Lambda runs outside the VPC and uses GitHub OAuth with PKCE
 and browser-bound, single-use state (10-minute expiry). DynamoDB conditional
 deletion enforces expiry and prevents replay independently of TTL cleanup.
 Only active members of `github_organization` may obtain a browser session.
-OAuth redirects to `/desktop` to choose AWA Linux or AWP Windows. Sessions
+OAuth redirects to `/desktop` to choose セキュアブラウザ (AppStream Linux) or
+パーソナルデスクトップ (WorkSpaces Personal Windows). See the
+[service descriptions](../README.md#端末の呼び名と用途) for usage and connection methods. Sessions
 expire after one hour, store only a hash of the random cookie token, and use
 CSRF tokens plus same-origin POST validation. Tokens from GitHub are never saved.
+The HTML Content Security Policy restricts form submissions to `form-action 'self'`.
+`POST /linux` validates the session, origin, and CSRF token, records the Linux
+selection, and returns an HTTP 200 handoff page with an immediate meta refresh
+and a fallback link to `/linux`. This ends the form submission before a separate
+GET navigation checks capacity and redirects to AppStream. Chromium checks the
+entire redirect chain of form submissions, including AppStream's downstream
+hosts; the handoff avoids expanding the form-action allowlist.
+The POST origin and CSRF checks remain unchanged. After deploying this change,
+reload `/desktop` before trying again; an already open page retains its old policy.
 
 After applying, follow [GITHUB-SETUP.md](../GITHUB-SETUP.md) to register an OAuth
 App with the callback output and populate the secret output with

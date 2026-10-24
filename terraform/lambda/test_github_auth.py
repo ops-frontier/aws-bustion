@@ -5,6 +5,7 @@ import json
 import os
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -97,6 +98,7 @@ class AuthTestCase(unittest.TestCase):
             os.environ,
             {
                 "BASE_URL": "https://example.execute-api.ap-northeast-1.amazonaws.com",
+                "AWS_REGION": "ap-northeast-1",
                 "GITHUB_ORGANIZATION": "example-org",
                 "OAUTH_SECRET_ARN": "test-secret",
                 "STATE_TABLE": "test-state",
@@ -172,7 +174,12 @@ class AuthTestCase(unittest.TestCase):
         result = auth.lambda_handler(event, None)
         if result["statusCode"] != 302 or result["headers"]["Location"] != "/desktop":
             return result
-        return auth.lambda_handler(self.session_event(result, "POST /linux"), None)
+        callback = result
+        result = auth.lambda_handler(self.session_event(callback, "POST /linux"), None)
+        if result["statusCode"] != 200:
+            return result
+        self.assertIn('content="0;url=/linux"', result["body"])
+        return auth.lambda_handler(self.session_event(callback, "GET /linux"), None)
 
     def session_event(self, callback, route, form=None):
         cookie = next(c for c in callback["cookies"] if c.startswith(auth.SESSION_COOKIE + "="))
@@ -207,6 +214,18 @@ class OAuthTests(AuthTestCase):
         self.assertEqual(result["headers"]["Cache-Control"], "no-store")
         self.assertIn('<html lang="ja">', result["body"])
         self.assertIn('name="viewport"', result["body"])
+        self.assertIn('<link rel="icon" href="/favicon.ico" type="image/x-icon">', result["body"])
+        self.assertIn(
+            '<header><img src="/ops-frontier-logo.svg" alt="ops-frontier">'
+            '<p class="service-title">ゼロトラスト仮想化端末サービス</p></header>',
+            result["body"],
+        )
+        for rule in (
+            "grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)",
+            "justify-self:start", "@media(max-width:64rem)",
+            ".service-title{grid-row:2;}",
+        ):
+            self.assertIn(rule, result["body"])
         for rule in (
             "min-height:100vh", "display:flex", "align-items:center",
             "justify-content:center", "text-align:center",
@@ -215,9 +234,52 @@ class OAuthTests(AuthTestCase):
         nonce = result["body"].split('<style nonce="', 1)[1].split('"', 1)[0]
         self.assertEqual(
             result["headers"]["Content-Security-Policy"],
-            f"default-src 'none'; style-src 'nonce-{nonce}'; frame-ancestors 'none'; "
+            f"default-src 'none'; img-src 'self'; style-src 'nonce-{nonce}'; frame-ancestors 'none'; "
             "form-action 'self'; base-uri 'none'",
         )
+
+    def test_form_action_allows_only_self(self):
+        for region in ("ap-northeast-1", "us-west-2"):
+            with self.subTest(region=region), patch.dict(os.environ, {"AWS_REGION": region}):
+                result = auth.desktop_response({"csrf": {"S": "test-csrf"}})
+                directives = result["headers"]["Content-Security-Policy"].split("; ")
+                form_action = next(d for d in directives if d.startswith("form-action "))
+                self.assertEqual(
+                    form_action.split(),
+                    ["form-action", "'self'"],
+                )
+                self.assertIn("base-uri 'none'", directives)
+                self.assertIn('action="/linux"', result["body"])
+
+    def test_static_assets_are_served_without_authentication(self):
+        for filename, content_type in (
+            ("favicon.ico", "image/x-icon"),
+            ("ops-frontier-logo.svg", "image/svg+xml"),
+        ):
+            with self.subTest(filename=filename):
+                result = auth.lambda_handler({"routeKey": f"GET /{filename}"}, None)
+                self.assertEqual(result["statusCode"], 200)
+                self.assertEqual(result["headers"]["Content-Type"], content_type)
+                self.assertTrue(result["isBase64Encoded"])
+                self.assertEqual(
+                    base64.b64decode(result["body"], validate=True),
+                    Path(__file__).with_name(filename).read_bytes(),
+                )
+                self.assertEqual(result["headers"]["X-Content-Type-Options"], "nosniff")
+                self.assertNotIn("cookies", result)
+        self.secret.get_secret_value.assert_not_called()
+        self.github.assert_not_called()
+        self.assertEqual(self.state.items, {})
+
+    def test_static_asset_routes_only_allow_known_get_requests(self):
+        for route in (
+            "POST /favicon.ico", "POST /ops-frontier-logo.svg",
+            "GET /github_auth.py", "GET /../github_auth.py",
+        ):
+            with self.subTest(route=route):
+                result = auth.lambda_handler({"routeKey": route}, None)
+                self.assertEqual(result["statusCode"], 404)
+                self.assert_centered_japanese_page(result)
 
     def test_session_ended_page_offers_login_without_starting_oauth(self):
         result = auth.lambda_handler({"routeKey": "GET /session-ended"}, None)
@@ -242,10 +304,10 @@ class OAuthTests(AuthTestCase):
         self.assert_centered_japanese_page(result)
         self.assertIn("<h1>接続用リソースを準備しています</h1>", result["body"])
         self.assertIn("10〜20 分", result["body"])
-        self.assertIn("60 秒ごと", result["body"])
+        self.assertIn("20 秒ごと", result["body"])
         self.assertIn('<a href="/linux">もう一度確認する</a>', result["body"])
-        self.assertIn('http-equiv="refresh" content="60;url=/linux"', result["body"])
-        self.assertEqual(result["headers"]["Retry-After"], "60")
+        self.assertIn('http-equiv="refresh" content="20;url=/linux"', result["body"])
+        self.assertEqual(result["headers"]["Retry-After"], "20")
         self.assertIn("Max-Age=0", result["cookies"][0])
 
     def test_active_member_launches_with_stable_id_and_60_second_url(self):
@@ -297,7 +359,7 @@ class OAuthTests(AuthTestCase):
         )
         self.appstream.create_streaming_url.assert_not_called()
         self.assertEqual(result["statusCode"], 503)
-        self.assertEqual(result["headers"]["Retry-After"], "60")
+        self.assertEqual(result["headers"]["Retry-After"], "20")
         self.assertIn('href="/linux"', result["body"])
         self.assertIn('http-equiv="refresh"', result["body"])
         self.assertNotIn("Location", result["headers"])
@@ -355,14 +417,33 @@ class OAuthTests(AuthTestCase):
         self.appstream.update_fleet.assert_not_called()
         self.appstream.create_streaming_url.assert_called_once()
 
+    def test_linux_post_ends_form_submission_before_external_navigation(self):
+        _, _, event = self.begin()
+        callback = auth.lambda_handler(event, None)
+        result = auth.lambda_handler(self.session_event(callback, "POST /linux"), None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assert_centered_japanese_page(result)
+        self.assertNotIn("Location", result["headers"])
+        self.assertIn('http-equiv="refresh" content="0;url=/linux"', result["body"])
+        self.assertIn('<a href="/linux">接続を続ける</a>', result["body"])
+        self.appstream.describe_fleets.assert_not_called()
+        self.appstream.create_streaming_url.assert_not_called()
+        result = auth.lambda_handler(self.session_event(callback, "GET /linux"), None)
+        self.assertEqual(result["statusCode"], 302)
+        self.assertEqual(result["headers"]["Location"], "https://stream.example.com/session")
+
     def test_linux_waiting_poll_resumes_without_oauth_or_selection(self):
         _, _, event = self.begin()
         callback = auth.lambda_handler(event, None)
         capacity = self.appstream.describe_fleets.return_value["Fleets"][0]["ComputeCapacityStatus"]
         capacity.update(Desired=1, Available=0, InUse=0)
         result = auth.lambda_handler(self.session_event(callback, "POST /linux"), None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn('content="0;url=/linux"', result["body"])
+        self.assertNotIn("Location", result["headers"])
+        result = auth.lambda_handler(self.session_event(callback, "GET /linux"), None)
         self.assertEqual(result["statusCode"], 503)
-        self.assertIn('content="60;url=/linux"', result["body"])
+        self.assertIn('content="20;url=/linux"', result["body"])
         capacity["Available"] = 1
         result = auth.lambda_handler(self.session_event(callback, "GET /linux"), None)
         self.assertEqual(result["headers"]["Location"], "https://stream.example.com/session")
@@ -562,8 +643,13 @@ class WindowsTests(AuthTestCase):
         callback = self.login()
         result = auth.lambda_handler(self.session_event(callback, "GET /desktop"), None)
         self.assertEqual(result["statusCode"], 200)
-        for text in ("AWA Linux", "AWP Windows", auth.CLIENT_DOWNLOAD, 'action="/linux"', 'action="/windows"'):
+        for text in (
+            "セキュアブラウザを使用する", "パーソナルデスクトップを使用する",
+            auth.CLIENT_DOWNLOAD, 'action="/linux"', 'action="/windows"',
+        ):
             self.assertIn(text, result["body"])
+        for old_name in ("AWA Linux", "AWP Windows"):
+            self.assertNotIn(old_name, result["body"])
         self.ds_data.create_user.assert_not_called()
         self.workspaces.create_workspaces.assert_not_called()
         self.appstream.create_streaming_url.assert_not_called()
@@ -573,11 +659,29 @@ class WindowsTests(AuthTestCase):
         callback = self.login()
         result = auth.lambda_handler(self.session_event(callback, "POST /windows"), None)
         self.assertEqual(result["statusCode"], 200)
+        self.assertIn("<h1>パーソナルデスクトップの初回登録</h1>", result["body"])
         self.assertIn('type="password"', result["body"])
         self.assertIn('name="confirm"', result["body"])
         self.assertIn("変更しない", result["body"])
         self.assertEqual(self.state.users, {})
         self.ds_data.create_user.assert_not_called()
+
+    def test_personal_desktop_waiting_and_connection_labels(self):
+        result = auth.windows_waiting_response()
+        self.assertIn("<title>パーソナルデスクトップを準備しています</title>", result["body"])
+        self.assertIn("<h1>パーソナルデスクトップを準備しています</h1>", result["body"])
+        self.assertIn("20 秒ごと", result["body"])
+        self.assertIn('http-equiv="refresh" content="20;url=/windows"', result["body"])
+        self.workspaces.describe_workspaces.return_value = {
+            "Workspaces": [{"State": "AVAILABLE"}],
+        }
+        self.workspaces.describe_workspace_directories.return_value = {
+            "Directories": [{"RegistrationCode": "test-registration"}],
+        }
+        result = auth.workspace_response({"login": {"S": "test-user"}}, {})
+        self.assertIn("<title>パーソナルデスクトップに接続</title>", result["body"])
+        self.assertIn("<h1>パーソナルデスクトップに接続できます</h1>", result["body"])
+        self.assertIn('href="workspaces://test-user@test-registration"', result["body"])
 
     def test_first_registration_and_creation_then_poll_and_launch(self):
         callback = self.login()
@@ -609,7 +713,7 @@ class WindowsTests(AuthTestCase):
         self.workspaces.describe_workspaces.return_value = {
             "Workspaces": [{"WorkspaceId": "ws-123456789", "State": "PENDING"}],
         }
-        self.assertIn('content="30;url=/windows"', auth.lambda_handler(poll, None)["body"])
+        self.assertIn('content="20;url=/windows"', auth.lambda_handler(poll, None)["body"])
         for state in ("AVAILABLE", "STOPPED"):
             self.workspaces.describe_workspaces.return_value["Workspaces"][0]["State"] = state
             self.workspaces.describe_workspace_directories.return_value = {
@@ -653,7 +757,8 @@ class WindowsTests(AuthTestCase):
             callback = self.login(login)
             result = auth.lambda_handler(self.session_event(callback, "POST /windows"), None)
             self.assertEqual(result["statusCode"], 400)
-            self.assertEqual(auth.lambda_handler(self.session_event(callback, "POST /linux"), None)["statusCode"], 302)
+            self.assertEqual(auth.lambda_handler(self.session_event(callback, "POST /linux"), None)["statusCode"], 200)
+            self.assertEqual(auth.lambda_handler(self.session_event(callback, "GET /linux"), None)["statusCode"], 302)
         self.assertEqual(self.state.users, {})
         self.assertEqual(
             auth.validate_windows_login({"login": {"S": "a" * 20}}), "a" * 20,
@@ -854,6 +959,7 @@ class WindowsApiTests(unittest.TestCase):
         with (
             Stubber(client) as stub, patch.object(auth, "aws_client", return_value=client),
             patch.object(auth, "update_user"), patch.dict(os.environ, {
+                "AWS_REGION": "ap-northeast-1",
                 "DIRECTORY_ID": "d-1234567890", "WORKSPACE_BUNDLE_ID": "wsb-96cqc2ksn",
             }),
         ):

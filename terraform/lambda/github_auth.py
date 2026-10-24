@@ -9,6 +9,7 @@ import secrets
 import time
 from html import escape
 from http.cookies import CookieError, SimpleCookie
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -29,6 +30,10 @@ AWS_CONFIG = Config(connect_timeout=2, read_timeout=3, retries={"total_max_attem
 # Directory and WorkSpaces writes can exceed 3 seconds; three calls still fit the 29-second Lambda timeout.
 SLOW_AWS_CONFIG = Config(connect_timeout=2, read_timeout=7, retries={"total_max_attempts": 1})
 SLOW_SERVICES = {"ds", "ds-data", "workspaces"}
+STATIC_ASSETS = {
+    "GET /favicon.ico": ("favicon.ico", "image/x-icon"),
+    "GET /ops-frontier-logo.svg": ("ops-frontier-logo.svg", "image/svg+xml"),
+}
 
 
 class AuthError(Exception):
@@ -197,7 +202,7 @@ def ensure_fleet_capacity(appstream):
     fleets = appstream.describe_fleets(Names=[fleet_name])["Fleets"]
     if len(fleets) != 1 or fleets[0]["State"] != "RUNNING":
         raise AuthError(
-            503, "fleet_unavailable", "Linux フリートが稼働していません。管理者にお問い合わせください。"
+            503, "fleet_unavailable", "セキュアブラウザのフリートが稼働していません。管理者にお問い合わせください。"
         )
     capacity = fleets[0]["ComputeCapacityStatus"]
     # Preserve reconnection to existing sessions even if no spare instance exists.
@@ -219,19 +224,30 @@ def page_response(status, title, body, head=""):
         '<!doctype html><html lang="ja"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"{head}<title>{title}</title>"
+        '<link rel="icon" href="/favicon.ico" type="image/x-icon">'
         f'<style nonce="{nonce}">'
-        "body{margin:0;min-height:100vh;display:flex;align-items:center;"
+        "body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;"
         "justify-content:center;text-align:center;font-family:sans-serif;}"
-        "main{box-sizing:border-box;max-width:48rem;padding:2rem;}"
+        "header{box-sizing:border-box;width:100%;display:grid;"
+        "grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);"
+        "align-items:center;gap:1rem;padding:1rem;}"
+        "header img{width:12rem;max-width:100%;height:auto;justify-self:start;}"
+        ".service-title{margin:0;font-size:1.5rem;font-weight:bold;}"
+        "main{box-sizing:border-box;max-width:48rem;padding:2rem;margin:auto;}"
         "h1{font-size:1.5rem;}p{line-height:1.8;}"
-        f"</style></head><body><main>{body}</main></body></html>",
+        "@media(max-width:64rem){header{grid-template-columns:minmax(0,1fr);}"
+        ".service-title{grid-row:2;}}"
+        "</style></head><body><header>"
+        '<img src="/ops-frontier-logo.svg" alt="ops-frontier">'
+        '<p class="service-title">ゼロトラスト仮想化端末サービス</p>'
+        f"</header><main>{body}</main></body></html>",
         cookie="",
     )
     result["headers"]["Content-Type"] = "text/html; charset=utf-8"
     # Browsers send "Origin: null" on form POSTs from no-referrer pages, which fails the origin check.
     result["headers"]["Referrer-Policy"] = "same-origin"
     result["headers"]["Content-Security-Policy"] = (
-        f"default-src 'none'; style-src 'nonce-{nonce}'; frame-ancestors 'none'; "
+        f"default-src 'none'; img-src 'self'; style-src 'nonce-{nonce}'; frame-ancestors 'none'; "
         "form-action 'self'; base-uri 'none'"
     )
     return result
@@ -389,10 +405,10 @@ def desktop_response(session):
         200, "利用する端末を選択",
         "<h1>利用する端末を選択してください</h1>"
         f'<form method="post" action="/linux">{csrf_field(session)}'
-        '<p><button type="submit">AWA Linux を使用する</button></p></form>'
+        '<p><button type="submit">セキュアブラウザを使用する</button></p></form>'
         f'<form method="post" action="/windows">{csrf_field(session)}'
-        '<p><button type="submit">AWP Windows を使用する</button></p></form>'
-        f'<p>Windows を使用する前に <a href="{CLIENT_DOWNLOAD}">'
+        '<p><button type="submit">パーソナルデスクトップを使用する</button></p></form>'
+        f'<p>パーソナルデスクトップを使用する前に <a href="{CLIENT_DOWNLOAD}">'
         "WorkSpaces DCV クライアントをインストール</a>してください。</p>",
     )
 
@@ -405,7 +421,7 @@ def validate_windows_login(session):
     ):
         raise AuthError(
             400, "unsupported_windows_login",
-            "Windows を使用する GitHub ユーザー名は 20 文字以下で、"
+            "パーソナルデスクトップを使用する GitHub ユーザー名は 20 文字以下で、"
             "Admin、Administrator、Guest、krbtgt 以外である必要があります。",
         )
     return login
@@ -467,11 +483,11 @@ def update_user(session, expression, values):
 
 def password_response(session, message="", status=200):
     return page_response(
-        status, "Windows の初回登録",
-        "<h1>Windows の初回登録</h1>"
+        status, "パーソナルデスクトップの初回登録",
+        "<h1>パーソナルデスクトップの初回登録</h1>"
         f"<p>ユーザー名: {escape(session['login']['S'])}</p>"
         "<p>登録後は GitHub のユーザー名を変更しないでください。"
-        "変更された場合、Windows の利用を拒否します。</p>"
+        "変更された場合、パーソナルデスクトップの利用を拒否します。</p>"
         f"<p>{escape(message)}</p>"
         f'<form method="post" action="/windows">{csrf_field(session)}'
         '<p><label>パスワード <input type="password" name="password" '
@@ -480,7 +496,7 @@ def password_response(session, message="", status=200):
         'required minlength="8" maxlength="127" autocomplete="new-password"></label></p>'
         "<p>8〜127 文字で、英大文字・英小文字・数字・記号のうち 3 種類以上を使用し、"
         "ユーザー名を含めないでください。ディレクトリのポリシーも適用されます。</p>"
-        '<button type="submit">登録して Windows を準備する</button></form>',
+        '<button type="submit">登録してパーソナルデスクトップを準備する</button></form>',
     )
 
 
@@ -550,8 +566,8 @@ def register_directory_user(session, form):
 
 def windows_waiting_response():
     return page_response(
-        200, "Windows を準備しています",
-        "<h1>Windows を準備しています</h1>"
+        200, "パーソナルデスクトップを準備しています",
+        "<h1>パーソナルデスクトップを準備しています</h1>"
         "<p>WorkSpace の作成と起動には10分程度の時間がかかります。20 秒ごとに状況を確認します。</p>"
         '<p><a href="/windows">もう一度確認する</a></p>'
         '<p>長時間完了しない場合は管理者にお問い合わせください。</p>',
@@ -579,8 +595,8 @@ def workspace_response(session, record):
                 directories[0]["RegistrationCode"], safe=""
             )
             return page_response(
-                200, "Windows に接続",
-                "<h1>Windows に接続できます</h1>"
+                200, "パーソナルデスクトップに接続",
+                "<h1>パーソナルデスクトップに接続できます</h1>"
                 f'<p><a href="{escape(uri, quote=True)}">WorkSpaces クライアントを起動する</a></p>'
                 "<p>起動を許可し、登録時に設定したパスワードを入力してください。</p>"
                 f'<p>起動できない場合は <a href="{CLIENT_DOWNLOAD}">'
@@ -706,6 +722,14 @@ def windows_response(event, key, session, form):
 def lambda_handler(event, context):
     try:
         route = event.get("routeKey")
+        if route in STATIC_ASSETS:
+            filename, content_type = STATIC_ASSETS[route]
+            result = response(
+                200, base64.b64encode(Path(__file__).with_name(filename).read_bytes()).decode("ascii")
+            )
+            result["headers"]["Content-Type"] = content_type
+            result["isBase64Encoded"] = True
+            return result
         if route in ("GET /", "GET /login"):
             return start_login()
         if route == "GET /callback":
@@ -726,7 +750,13 @@ def lambda_handler(event, context):
                         ":yes": {"BOOL": True}, ":now": {"N": str(int(time.time()))},
                     },
                 )
-                return launch_linux(session)
+                # End the form submission before starting AppStream's cross-origin redirect chain.
+                return page_response(
+                    200, "セキュアブラウザに接続",
+                    "<h1>セキュアブラウザに接続しています</h1>"
+                    '<p>自動で進まない場合は <a href="/linux">接続を続ける</a>を押してください。</p>',
+                    head='<meta http-equiv="refresh" content="0;url=/linux">',
+                )
             if route == "GET /linux":
                 if not session.get("linux_started", {}).get("BOOL"):
                     return response(302, location="/desktop")

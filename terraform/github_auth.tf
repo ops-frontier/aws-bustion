@@ -117,7 +117,8 @@ resource "aws_iam_role_policy" "github_auth" {
 
 data "archive_file" "github_auth" {
   type        = "zip"
-  source_file = "${path.module}/lambda/github_auth.py"
+  source_dir  = "${path.module}/lambda"
+  excludes    = ["test_github_auth.py", "__pycache__", "__pycache__/*"]
   output_path = "${path.module}/.terraform/github-auth.zip"
 }
 
@@ -163,7 +164,8 @@ resource "aws_apigatewayv2_integration" "github_auth" {
 resource "aws_apigatewayv2_route" "github_auth" {
   for_each = toset([
     "GET /", "GET /login", "GET /callback", "GET /session-ended",
-    "GET /desktop", "POST /linux", "GET /linux", "POST /windows", "GET /windows"
+    "GET /desktop", "POST /linux", "GET /linux", "POST /windows", "GET /windows",
+    "GET /favicon.ico", "GET /ops-frontier-logo.svg"
   ])
 
   api_id    = aws_apigatewayv2_api.github_auth.id

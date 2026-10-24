@@ -206,8 +206,8 @@ run "github_launch_service" {
   }
 
   assert {
-    condition     = toset(keys(aws_apigatewayv2_route.github_auth)) == toset(["GET /", "GET /login", "GET /callback", "GET /session-ended", "GET /desktop", "POST /linux", "GET /linux", "POST /windows", "GET /windows"])
-    error_message = "Only the expected login, callback, and session-ended routes should be exposed."
+    condition     = toset(keys(aws_apigatewayv2_route.github_auth)) == toset(["GET /", "GET /login", "GET /callback", "GET /session-ended", "GET /desktop", "POST /linux", "GET /linux", "POST /windows", "GET /windows", "GET /favicon.ico", "GET /ops-frontier-logo.svg"])
+    error_message = "Only the expected authentication, desktop, and branding asset routes should be exposed."
   }
 
   assert {

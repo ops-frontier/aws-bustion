@@ -2,6 +2,23 @@
 
 Terraform で Amazon AppStream 2.0 (WorkSpaces Applications) のネットワーク、Fleet、Stack を作成する IaC です。利用者は Linux デスクトップから Chrome や VS Code を使い、開発環境へ接続する想定です。
 
+## 端末の呼び名と用途
+
+GitHub 認証後の選択画面では、次の 2 種類の端末を選べます。呼び名のみの変更で、利用する AWS サービスや接続方法は変わりません。
+
+| 呼び名 | 旧称 / 基盤 | 用途・接続方法 |
+| --- | --- | --- |
+| セキュアブラウザ | 旧称: AWA Linux / Amazon AppStream 2.0（WorkSpaces Applications）の Linux 環境 | ブラウザーからリモートの Linux デスクトップに接続し、Chrome や VS Code で Web サービス・開発環境を利用します。専用クライアントは不要です。 |
+| パーソナルデスクトップ | 旧称: AWP Windows / Amazon WorkSpaces Personal の Windows 環境 | 利用者ごとに割り当てられた Windows デスクトップを利用します。事前に WorkSpaces DCV クライアントをインストールし、初回に設定するディレクトリのパスワードで接続します。 |
+
+### セキュアブラウザ
+
+Web サービスや開発環境へのアクセスに使うリモート環境です。名称はブラウザーを中心とした用途を表しますが、実体は Chrome や VS Code を含む Linux デスクトップであり、ブラウザー専用の別サービスではありません。Fleet の端末をセッションごとに利用し、ホームフォルダ保存・アプリケーション設定の永続化は無効です。必要なファイルは外部のリポジトリなどへ保存してください。時間外などで Fleet が 0 台の場合は、端末の起動準備を待ってから接続します。
+
+### パーソナルデスクトップ
+
+Windows アプリケーションや、利用者専用の継続的な作業環境が必要な場合に使用します。初回にディレクトリユーザーと WorkSpace をオンデマンドで作成し、以降は同じ WorkSpace を再利用します。GitHub ユーザー名は 20 文字以下で、予約名（Admin、Administrator、Guest、krbtgt）以外である必要があり、登録後は変更しないでください。ポータルは GitHub OAuth、端末への接続はディレクトリのパスワードで認証します。構成・制約・導入手順は [WINDOWS-AWP.md](WINDOWS-AWP.md#実装と導入) を参照してください。
+
 ## 現在の実装範囲
 
 - 2 つのプライベートサブネットを持つ VPC とリージョナル NAT Gateway
@@ -24,10 +41,12 @@ Terraform は公開済みの AppStream イメージを使用します。イメ�
        → API Gateway /callback → Lambda
        → GitHub API で本人と Organization の active メンバーシップを確認
        → 利用する端末の選択画面
-       → AWA Linux を選択
+       → セキュアブラウザを選択
        → Fleet の容量を確認（0 台なら 1 台を要求し、起動準備中は待機画面）
        → AppStream CreateStreamingURL → AppStream にリダイレクト
 ```
+
+パーソナルデスクトップを選択した場合は、初回登録と WorkSpace の作成・起動を経て、WorkSpaces DCV クライアントで接続します。
 
 Cognito、OIDC ラッパー、SAML IdP は使用しません。`github_organization` に指定した Organization の有効なメンバー全員（非公開メンバーを含む）を許可し、招待待ち・非メンバーは拒否します。`read:org` scope のユーザートークンで本人のメンバーシップを確認するため、管理者の PAT は不要です。
 
@@ -96,7 +115,7 @@ Terraform state は現在ローカルに保存されます。Codespace を削除
 - 0 台からの起動には数分〜十数分かかるため、開始時刻を 9:00 より早めています。実際の起動時間が30分を超える場合は、開始時刻をさらに早めてください。
 - 利用中のセッションがあり、空きが 1 台以下になった時点で 1 台追加します。空き 3 台以上、または利用中 0 で空き 2 台以上の状態が 5 分続くと 1 台削減します。スケールアウトのクールダウンは 120 秒、スケールインは 300 秒です。再 apply では自動調整後の容量を初期値に戻しません。
 - 利用中 0 で空きがある状態が 30 分続くと 1 台削減します。日中は最小容量 1 台が残り、17:00 以降は最後の 1 台も停止します。17:00 時点で使用中のセッションは強制終了しません。
-- 時間外（0 台）は、GitHub 認証後に AWA Linux を選択すると Lambda が `DesiredInstances = 1` を明示的に要求します。CloudWatch の容量不足アラームや AppStream の Retry には依存しません。利用中のセッションも空きもない起動準備中は、起動 URL を発行せず日本語の待機画面（503 / `Retry-After: 60`）を画面中央に表示します。通常 10〜20 分程度かかり、同じブラウザーセッションで 60 秒ごとに `/linux` から容量を確認し、空きができたら AppStream に進みます。手動では「もう一度確認する」を押してください（使用済み callback URL の再読み込みは不可）。要求済みの容量がある間は追加要求しません。既存セッションへの再接続は従来どおりです。
+- 時間外（0 台）は、GitHub 認証後にセキュアブラウザを選択すると Lambda が `DesiredInstances = 1` を明示的に要求します。CloudWatch の容量不足アラームや AppStream の Retry には依存しません。利用中のセッションも空きもない起動準備中は、起動 URL を発行せず日本語の待機画面（503 / `Retry-After: 20`）を画面中央に表示します。通常 10〜20 分程度かかり、同じブラウザーセッションで 20 秒ごとに `/linux` から容量を確認し、空きができたら AppStream に進みます。手動では「もう一度確認する」を押してください（使用済み callback URL の再読み込みは不可）。要求済みの容量がある間は追加要求しません。既存セッションへの再接続は従来どおりです。
 - これらの待ち時間は未使用容量の縮小待ち時間であり、接続中ユーザーの無操作による切断タイムアウトではありません。使用中のセッションはスケールインで強制終了しません。
 - リージョナル NAT Gateway、AppStream、共有ポータルで使用する Managed Microsoft AD と WorkSpaces には継続的な料金が発生します。不要時の破棄手順は [WINDOWS-AWP.md](WINDOWS-AWP.md#適用手順) を参照してください。実行時に作成した WorkSpace は `terraform destroy` の管理対象外です。
 - AppStream のサービスロール `AmazonAppStreamServiceAccess` は他の AppStream 環境と共用するため Terraform では管理せず、`terraform destroy` でも削除されません。事前に作成しておく必要があります（[AWS-SETUP.md](AWS-SETUP.md) を参照）。
