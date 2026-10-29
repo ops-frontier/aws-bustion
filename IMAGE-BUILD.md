@@ -160,6 +160,15 @@ sudo tee /etc/opt/chrome/policies/managed/secure-browser.json > /dev/null <<'EOF
 EOF
 sudo chown root:root /etc/opt/chrome/policies/managed/secure-browser.json
 sudo chmod 0644 /etc/opt/chrome/policies/managed/secure-browser.json
+
+sudo tee /etc/opt/chrome/policies/managed/languages.json > /dev/null <<'EOF'
+{
+  "ForcedLanguages": ["ja", "en-US", "en"]
+}
+EOF
+
+sudo chown root:root /etc/opt/chrome/policies/managed/languages.json
+sudo chmod 0644 /etc/opt/chrome/policies/managed/languages.json
 ```
 
 | 設定 | 効果 |
@@ -314,3 +323,108 @@ macOS では `Control + Space` が標準で手元の入力ソース切り替え�
 - **End Session は、手元のブラウザの GitHub ログアウトや Codespaces の停止・削除を行いません。** 共有 PC では手元の GitHub からもログアウトし、必要に応じて Codespace を停止してください。ブラウザデータの破棄だけで GitHub 側の認可が取り消されるわけでもありません。
 - ブラウザの同期禁止と、Codespaces / VS Code の Settings Sync は別です。開発環境の設定同期については組織の方針に従ってください。
 - ファイル転送・クリップボード・印刷は、管理者の設定により制限される場合があります。利用できない場合は、許可された保存・共有方法を確認してください。
+
+# イメージのアップデート手順
+
+## 1. Image Builder に管理者で接続する
+
+1. Amazon WorkSpaces Applications の **Images → Image Builder** で、イメージ作成時に使用した Image Builder を開きます。名前は作成時の設定を確認してください（例：`image-builder-${BUSTION_GITHUB_ORGANIZATION}` または `image-builder-linux-${BUSTION_GITHUB_ORGANIZATION}`）。
+2. Status が **Stopped** の場合は **Actions → Start** で起動し、**Running** になるまで待ちます。
+3. **Connect** で接続し、**ImageBuilderAdmin** として操作します。Chrome と VS Code を終了し、**Applications → Terminal** を開きます。
+
+以下の更新コマンドは Image Builder 内で実行します。途中でエラーが出た場合はイメージを作成せず、原因を解消してください。
+
+## 2. OS・Chrome・VS Code 本体を更新する
+
+```shell
+sudo dnf upgrade --refresh -y
+rpm -q google-chrome-stable code
+```
+
+`dnf upgrade`（`dnf update` と同義）は OS パッケージに加え、有効なリポジトリにある Chrome と VS Code も更新します。VS Code の拡張機能は対象外です。
+
+Chrome または VS Code が更新されない場合は、リポジトリと更新候補を確認します。最新版が既に導入済みの場合、更新候補は表示されません。
+
+```shell
+dnf repolist --enabled
+dnf list --showduplicates google-chrome-stable code
+```
+
+初回手順の Chrome RPM は通常 Google のリポジトリを登録します。Google のリポジトリがない場合は、次の公式 RPM から更新できます。VS Code のリポジトリがない場合は「アプリケーションと日本語 IME のインストール」のリポジトリ設定を再実行してください。
+
+```shell
+sudo dnf install -y https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+```
+
+## 3. VS Code の拡張機能を更新して利用者へ配布する
+
+**ImageBuilderAdmin の Terminal で、`code` コマンドには `sudo` を付けずに**実行します。
+
+```shell
+code --list-extensions --show-versions
+code --update-extensions
+code --install-extension GitHub.codespaces --force
+code --list-extensions --show-versions
+```
+
+`--update-extensions` は、この管理者のローカル VS Code にインストールされた拡張機能を更新します。`GitHub.codespaces` は初回手順で必須としているため、未導入の場合も含めてインストールします。追加の共通拡張機能が必要な場合も、同じユーザーで `code --install-extension publisher.extension` を実行してください。
+
+更新後は VS Code を終了し、表示された拡張機能がすべて全利用者への配布対象であることを確認します。管理者で更新しただけでは、新規利用者には反映されません。初回手順と同様に `/etc/skel/.vscode/extensions` に配置し直します。
+
+次の処理は **スケルトン内の既存の共通拡張機能をすべて置き換えます**。スケルトンにだけある必要な拡張機能は、先に管理者にもインストールしてください。古いバージョンや削除済みの拡張機能を残さないため、単なる上書きコピーではなく置き換えます。
+
+```shell
+(
+    set -e
+    test -d "$HOME/.vscode/extensions"
+    sudo mkdir -p /etc/skel/.vscode
+    if [ -e /etc/skel/.vscode/extensions ]; then
+        sudo rm -r -- /etc/skel/.vscode/extensions
+    fi
+    sudo mkdir -p /etc/skel/.vscode/extensions
+    sudo cp -r "$HOME/.vscode/extensions/." /etc/skel/.vscode/extensions/
+    sudo chown -R root:root /etc/skel/.vscode/extensions
+    sudo chmod -R a+rX /etc/skel/.vscode/extensions
+)
+code --extensions-dir /etc/skel/.vscode/extensions --list-extensions --show-versions
+```
+
+管理者側と配布先の拡張機能の一覧・バージョンが一致することを確認します。Chrome や VS Code のユーザープロファイル、Cookie、認証情報はコピーしないでください。
+
+スケルトンはユーザー作成時に適用されるため、既に作成済みの Test User や既存 Fleet セッションのホームには遡って反映されません。最終確認は新イメージを使う Fleet の新規セッションで行ってください。また、Codespaces 内のリモート拡張機能やブラウザ版 VS Code の拡張機能は、この更新の対象外です。
+
+## 4. 再起動・動作確認後にイメージを作成する
+
+1. AWS コンソールから Image Builder を再起動し、**Running** に戻ったら再接続します。
+2. カタログから Chrome と VS Code を起動し、バージョン、日本語入力、Chrome のポリシー・優先言語・キーリング不要の動作、VS Code の拡張機能と Codespaces 接続を確認します。詳細は「アプリケーションの登録と Image Builder での確認」を参照してください。
+3. テスト用アカウントをログアウトし、Chrome と VS Code を終了します。
+4. 管理者の Terminal で、一意な名前を指定してイメージを作成します。同日に再作成する場合も重複しないよう連番などを付けてください。
+
+```shell
+export APPSTREAM_IMAGE_NAME='実際のイメージ名-YYYYMMDD-01'
+AppStreamImageAssistant create-image --name "${APPSTREAM_IMAGE_NAME}"
+```
+
+作成処理で接続が切断されます。**Images → Image Registry** を **Visibility = Private** で絞り込み、新イメージが **Available** になるまで待ってください。コマンド実行直後の切断や Image Builder の停止だけでは、イメージの完成確認になりません。
+
+## 5. Fleet のイメージを切り替えて確認する
+
+1. メンテナンス時間を案内し、利用者に保存と **End Session** を依頼します。作業中は新規接続も止めてください。
+2. **Fleets → `fleet-bustion-${BUSTION_GITHUB_ORGANIZATION}`** を開き、**In Use = 0** を確認してから **Actions → Stop** を実行し、**Stopped** になるまで待ちます。イメージ変更より先に停止します。
+3. **Image → Edit** で新しい `${APPSTREAM_IMAGE_NAME}` を選択し、**Save Changes** を実行します。
+4. Codespaces Secret の `APPSTREAM_IMAGE_NAME` も同じ新イメージ名に変更します。既存 Codespace の環境変数には自動反映されないため、Terraform を実行する Terminal でも更新してください。コンソールだけ変更すると、次回の Terraform 適用で旧イメージへ戻る可能性があります。
+
+   リポジトリ直下の Terminal で実行します（Image Builder 内ではありません）。
+
+   ```shell
+   export APPSTREAM_IMAGE_NAME='実際のイメージ名-YYYYMMDD-01'
+   export TF_VAR_appstream_image_name="$APPSTREAM_IMAGE_NAME"
+   python3 scripts/login.py
+   source ~/.config/aws-bustion/terraform-env.sh
+   ```
+
+   次回の Terraform 実行前には `terraform plan` でイメージ名が旧名に戻らないことも確認してください。
+
+5. **Actions → Start** を実行し、**Running** になるまで待ちます。
+6. Fleet の新規利用者セッションで、Chrome・VS Code 本体と拡張機能のバージョン、優先言語、日本語入力、GitHub / Codespaces 接続、キーリング不要の動作、**End Session** 後のデータ破棄を確認します。利用者側の VS Code Terminal では `code --list-extensions --show-versions` で配布された拡張機能を確認できます。
+7. 問題がなければ利用を再開します。問題がある場合は同じ停止・変更・起動手順で旧イメージへ戻し、Codespaces Secret と Terraform 用の環境変数も旧名に揃えます。検証が完了するまでは旧イメージを削除しないでください。

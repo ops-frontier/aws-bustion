@@ -146,3 +146,78 @@ Lambda の CloudWatch Logs とホスト上の RADIUS ログでエラーコード
 10. 同じユーザーの誤った OTP を 5 回送った後は正しい OTP も拒否され、5 分後に新しい OTP で再開できることを確認する。RADIUS を一時停止するとパスワードだけで新規接続できないことも確認し、直ちに再開する。既存セッションを必ず終了させてから新規ログインで試す。
 
 実機確認では WorkSpaces / AD の料金が発生する。ローカルの Lambda テストと Terraform モックテストは AWS リソースを作成しない。
+
+## RADIUS サーバーのソフトウェア更新
+
+対象は Ubuntu 24.04 ARM64 の RADIUS EC2。Linux イメージの DNF 更新とは別に、APT で OS・FreeRADIUS・Python の依存パッケージを更新する。**RADIUS は 1 台構成のため、パッケージ更新によるサービス再起動と EC2 再起動の間は、WorkSpaces の新規接続・再認証が失敗する。** メンテナンス時間を案内してから実施し、復旧確認までは利用再開を案内しない。MFA を無効にして更新中の接続を通す運用は行わない。
+
+### 1. 対象と復旧手段を確認する
+
+1. リポジトリの `terraform` ディレクトリで `terraform output -raw radius_instance_id` を実行し、対象リージョンと EC2 インスタンス ID を確認する。
+2. 更新前の復旧用として、対象の暗号化ルート EBS のスナップショットを取得し、完了を確認する。整合性が必要な場合はメンテナンス中に EC2 を停止して取得し、再起動する。スナップショットには RADIUS 共有秘密などが含まれるため、アクセスを制限し、公開・無断共有しない。スナップショットの保管には費用が発生する。
+3. AWS コンソールの **EC2 → 対象インスタンス → Connect → Session Manager** から接続する。SSH やパブリック IP は追加しない。
+
+以降のコマンドは、Codespaces ではなく **RADIUS EC2 上の Session Manager のシェル**で実行する。更新前に次を確認し、cloud-init やサービスに異常がある場合は先に解消する。
+
+```sh
+sudo cloud-init status --wait
+sudo systemctl is-active freeradius chrony
+sudo freeradius -C
+chronyc tracking
+df -h /
+```
+
+ルート EBS は 8 GiB のため、空き容量不足の場合は更新を開始しない。APT のロック競合時は、自動更新などの完了を待つ。ロックファイルを削除して強行しない。
+
+### 2. OS・FreeRADIUS・依存パッケージを更新する
+
+```sh
+sudo apt-get update
+apt list --upgradable
+sudo apt-get --simulate upgrade --with-new-pkgs
+sudo apt-get upgrade --with-new-pkgs
+```
+
+各コマンドが成功したことを確認してから次へ進む。シミュレーションと実行時の変更一覧を確認して承認する。更新対象には `freeradius`、`freeradius-python3`、`python3-boto3`、`chrony` と、それらの依存パッケージ・カーネルが含まれる。サービスが更新途中で自動再起動される場合がある。
+
+設定ファイルの置き換え確認が出た場合は、原則として **現在のローカル設定を保持**する。特に FreeRADIUS の PAP / Python モジュール、Message-Authenticator の必須設定、AD コントローラーのクライアント設定、chrony の Amazon Time Sync 設定を配布元の標準設定で上書きしない。更新で作成された `.dpkg-dist` などがあれば、メンテナンス中に差分を確認して必要な変更だけ取り込む。共有秘密を含む差分をチャットやログへ貼り付けない。
+
+保留されたパッケージがあれば理由を確認する。保留解除、パッケージ削除を伴う `full-upgrade`、Ubuntu のメジャーバージョン更新を、この定期更新の一環として無条件に実行しない。`pip install --upgrade` も不要で、Python 依存パッケージは既存構成と同じ APT 管理を維持する。
+
+```sh
+dpkg-query -W freeradius freeradius-python3 python3-boto3 chrony
+sudo dpkg --audit
+sudo freeradius -C
+```
+
+`dpkg --audit` に未設定パッケージなどが表示された場合や、`freeradius -C` が失敗した場合は、その出力に基づいて復旧してから進む。構文検証を通すために認証チェックを緩めたり、標準の認証サイトを有効化したりしない。
+
+### 3. 再起動して動作を確認する
+
+更新済みのカーネルとライブラリを確実に使用するため、メンテナンス中に再起動する。
+
+```sh
+sudo reboot
+```
+
+Session Manager の接続が切れるため、EC2 のステータスチェックが正常になり、SSM に再接続できるまで待つ。再接続後、次を確認する。
+
+```sh
+sudo cloud-init status --wait
+sudo systemctl is-active freeradius chrony
+sudo freeradius -C
+chronyc sources -v
+chronyc tracking
+sudo journalctl -u freeradius -b --no-pager -n 100
+sudo tail -n 100 /var/log/freeradius/radius.log
+```
+
+FreeRADIUS と chrony が `active`、FreeRADIUS の設定検証が成功、Amazon Time Sync（`169.254.169.123`）が同期元として選択され、時刻が同期していることを確認する。プロセスの起動確認だけでは完了とせず、テスト用 WorkSpace の既存セッションを終了し、DCV クライアントから AD パスワードと現在の OTP で新規接続する。誤った OTP・OTP 省略・同一コードの再利用では接続できないことも確認する。試行制限を超えないようにし、正常接続の再試行には次の OTP を使用する。
+
+失敗時はメンテナンスを継続し、通常ログと時刻同期、依存 AWS API への接続を確認する。本番の認証情報で FreeRADIUS の `-X` / `-x` は使用しない。復旧できない場合は、事前スナップショットからのルートボリューム復元など、既存 EC2 の構成と整合する方法で戻す。EC2 の置換やプライベート IP の変更を伴う復旧は Terraform で AD 側の RADIUS 設定も揃え、認証を再検証する。DynamoDB の使用済み OTP や試行制限の状態は巻き戻さない。
+
+### 4. 独自コード・起動設定の更新との違い
+
+APT 更新は `radius_auth.py`、`mfa.py`、FreeRADIUS の独自設定や cloud-init テンプレートを更新しない。それらを変更する場合はリポジトリを修正し、通常の `terraform plan` / `terraform apply` で反映する。本構成は user data 変更時に EC2 を置換するため、同様にメンテナンス時間が必要。plan では最新 Ubuntu AMI の変更に伴う置換も確認する。
+
+定期パッチのために cloud-init を手動で再実行したり、共有秘密を再生成したりしない。更新日時、対象インスタンス ID、パッケージバージョンと認証確認結果を運用記録に残すが、パスワード・OTP・シード・共有秘密は記録しない。
