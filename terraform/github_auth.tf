@@ -84,6 +84,19 @@ resource "aws_iam_role_policy" "github_auth" {
       },
       {
         Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.mfa.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Encrypt", "kms:Decrypt"]
+        Resource = aws_kms_key.mfa.arn
+        Condition = {
+          StringEquals = { "kms:EncryptionContext:purpose" = "bustion-totp" }
+        }
+      },
+      {
+        Effect   = "Allow"
         Action   = ["ds:AccessDSData", "ds:ResetUserPassword", "ds-data:CreateUser", "ds-data:DescribeUser"]
         Resource = "arn:aws:ds:${var.region}:${data.aws_caller_identity.current.account_id}:directory/${aws_directory_service_directory.windows.id}"
       },
@@ -118,8 +131,21 @@ resource "aws_iam_role_policy" "github_auth" {
 data "archive_file" "github_auth" {
   type        = "zip"
   source_dir  = "${path.module}/lambda"
-  excludes    = ["test_github_auth.py", "__pycache__", "__pycache__/*"]
+  excludes    = ["test_github_auth.py", "test_mfa.py", "requirements.txt", "__pycache__", "__pycache__/*"]
   output_path = "${path.module}/.terraform/github-auth.zip"
+}
+
+data "archive_file" "qr_layer" {
+  type        = "zip"
+  source_dir  = "${path.module}/.terraform/qr-layer"
+  output_path = "${path.module}/.terraform/qr-layer.zip"
+}
+
+resource "aws_lambda_layer_version" "qr" {
+  layer_name          = "qr-${local.name_suffix}"
+  filename            = data.archive_file.qr_layer.output_path
+  source_code_hash    = data.archive_file.qr_layer.output_base64sha256
+  compatible_runtimes = ["python3.13"]
 }
 
 resource "aws_lambda_function" "github_auth" {
@@ -131,6 +157,7 @@ resource "aws_lambda_function" "github_auth" {
   source_code_hash = data.archive_file.github_auth.output_base64sha256
   timeout          = 29
   memory_size      = 128
+  layers           = [aws_lambda_layer_version.qr.arn]
 
   environment {
     variables = {
@@ -143,6 +170,8 @@ resource "aws_lambda_function" "github_auth" {
       USERS_TABLE         = aws_dynamodb_table.windows_users.name
       DIRECTORY_ID        = aws_workspaces_directory.windows.id
       WORKSPACE_BUNDLE_ID = "wsb-96cqc2ksn"
+      MFA_TABLE           = aws_dynamodb_table.mfa.name
+      MFA_KEY_ARN         = aws_kms_key.mfa.arn
     }
   }
 

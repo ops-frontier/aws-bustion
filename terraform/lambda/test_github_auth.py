@@ -153,6 +153,10 @@ class AuthTestCase(unittest.TestCase):
         github_patch = patch.object(auth, "github_json")
         self.github = github_patch.start()
         self.addCleanup(github_patch.stop)
+        mfa_patch = patch.object(auth, "mfa_store")
+        self.mfa = mfa_patch.start().return_value
+        self.addCleanup(mfa_patch.stop)
+        self.mfa.prepare.return_value = {"active": {"BOOL": True}}
         self.github.side_effect = [
             {"access_token": "never-log-token"},
             {"id": 123456, "login": "changeable-name"},

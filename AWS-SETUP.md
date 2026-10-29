@@ -38,6 +38,8 @@ GitHub 認証サービス用に API Gateway v2、Lambda、DynamoDB、Secrets Man
 
 WorkSpaces Personal 用に、Directory Service のディレクトリ作成・削除・Directory Service Data 有効化、WorkSpaces のディレクトリ登録・解除、および共通サービスロールの `iam:GetRole` 権限も必要です。Windows の AD 管理者パスワードは Random Provider で生成され、Terraform state に含まれます。state とバックアップを厳重に管理してください。
 
+RADIUS MFA 用に EC2 インスタンス、IAM インスタンスプロファイル、専用ロールとその `iam:PassRole`、セキュリティグループ、KMS キー / エイリアス、Lambda Layer、および Directory Service の RADIUS 有効化・更新・無効化権限も必要です。Ubuntu AMI の公開 SSM パラメーターの参照と、RADIUS の準備完了を待つ SSM の `SendCommand`、`DescribeInstanceInformation`、`ListCommandInvocations`、`GetCommandInvocation`、`CancelCommand` 権限も必要です。RADIUS 共有シークレットは Terraform が生成して Secrets Manager に保存するため、**OAuth Secret と異なり Terraform state に含まれます**。EC2 の管理は SSM を使用し、SSH ポートは開放しません。運用者には必要なインスタンスに限定した SSM 操作権限を別途設定してください。
+
 IAM ユーザー側には、作成したロール ARN に対する `sts:AssumeRole` を許可します。信頼ポリシーとユーザーの許可ポリシーの両方が必要です。
 
 ### WorkSpaces Personal の共通サービスロール

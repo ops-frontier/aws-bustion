@@ -57,6 +57,40 @@ mock_provider "aws" {
       invoke_arn = "arn:aws:apigateway:ap-northeast-1:lambda:path/2015-03-31/functions/arn:aws:lambda:ap-northeast-1:123456789012:function:test/invocations"
     }
   }
+
+  mock_resource "aws_lambda_layer_version" {
+    defaults = {
+      arn = "arn:aws:lambda:ap-northeast-1:123456789012:layer:test-qr:1"
+    }
+  }
+
+  mock_resource "aws_kms_key" {
+    defaults = {
+      arn    = "arn:aws:kms:ap-northeast-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+      key_id = "12345678-1234-1234-1234-123456789012"
+    }
+  }
+
+  mock_resource "aws_directory_service_directory" {
+    defaults = {
+      id                = "d-1234567890"
+      dns_ip_addresses  = ["10.20.0.10", "10.20.16.10"]
+      security_group_id = "sg-1234567890abcdef0"
+    }
+  }
+
+  mock_data "aws_ssm_parameter" {
+    defaults = {
+      value = "ami-1234567890abcdef0"
+    }
+  }
+
+  mock_resource "aws_instance" {
+    defaults = {
+      id         = "i-1234567890abcdef0"
+      private_ip = "10.20.0.20"
+    }
+  }
 }
 
 mock_provider "random" {}
@@ -64,6 +98,7 @@ mock_provider "random" {}
 variables {
   # Keep the local-exec provisioner from calling the real AppStream API.
   disable_home_folders_with_cli = false
+  wait_for_radius_ready         = false
   github_organization           = "example-org"
   appstream_image_name          = "published-test-image"
 }
@@ -285,6 +320,71 @@ run "github_launch_service" {
 
   assert {
     condition = (
+      aws_instance.radius.instance_type == "t4g.micro" &&
+      !aws_instance.radius.associate_public_ip_address &&
+      aws_instance.radius.subnet_id == aws_subnet.private["0"].id &&
+      aws_instance.radius.metadata_options[0].http_tokens == "required" &&
+      aws_instance.radius.root_block_device[0].encrypted &&
+      length(aws_instance.radius.user_data_base64) <= 21844 &&
+      aws_instance.radius.user_data_replace_on_change
+    )
+    error_message = "RADIUS must run on one small private EC2 host with encrypted disk and IMDSv2."
+  }
+  assert {
+    condition = (
+      aws_vpc_security_group_ingress_rule.radius.ip_protocol == "udp" &&
+      aws_vpc_security_group_ingress_rule.radius.from_port == 1812 &&
+      aws_vpc_security_group_ingress_rule.radius.to_port == 1812 &&
+      aws_vpc_security_group_ingress_rule.radius.referenced_security_group_id == aws_directory_service_directory.windows.security_group_id &&
+      aws_vpc_security_group_ingress_rule.radius.cidr_ipv4 == null
+    )
+    error_message = "Only Directory Service may reach the RADIUS port."
+  }
+  assert {
+    condition = (
+      strcontains(file("${path.module}/../scripts/wait_radius_ready.sh"), "cloud-init status --wait") &&
+      strcontains(file("${path.module}/../scripts/wait_radius_ready.sh"), "systemctl is-active --quiet freeradius") &&
+      strcontains(file("${path.module}/../scripts/wait_radius_ready.sh"), "freeradius -C") &&
+      strcontains(file("${path.module}/radius/cloud-init.yaml.tftpl"), "rm -f /etc/freeradius/3.0/mods-enabled/eap")
+    )
+    error_message = "Directory MFA activation must wait for successful cloud-init and a running, valid RADIUS service."
+  }
+
+  assert {
+    condition = (
+      aws_directory_service_radius_settings.windows.authentication_protocol == "PAP" &&
+      aws_directory_service_radius_settings.windows.directory_id == aws_directory_service_directory.windows.id &&
+      aws_directory_service_radius_settings.windows.radius_servers == toset([aws_instance.radius.private_ip]) &&
+      aws_directory_service_radius_settings.windows.radius_port == 1812 &&
+      aws_directory_service_radius_settings.windows.shared_secret == random_password.radius.result
+    )
+    error_message = "The directory must require OTP validation against the private RADIUS host."
+  }
+  assert {
+    condition = (
+      aws_dynamodb_table.mfa.hash_key == "login" &&
+      aws_dynamodb_table.mfa.point_in_time_recovery[0].enabled &&
+      length(aws_dynamodb_table.mfa.ttl) == 0 &&
+      aws_kms_key.mfa.enable_key_rotation &&
+      random_password.radius.length == 64 &&
+      !random_password.radius.special &&
+      aws_lambda_function.github_auth.environment[0].variables.MFA_TABLE == aws_dynamodb_table.mfa.name &&
+      aws_lambda_function.github_auth.environment[0].variables.MFA_KEY_ARN == aws_kms_key.mfa.arn &&
+      aws_lambda_function.github_auth.layers == tolist([aws_lambda_layer_version.qr.arn])
+    )
+    error_message = "OTP records must be durable and encrypted, and Lambda must load the QR layer."
+  }
+  assert {
+    condition = (
+      !contains(flatten([for s in jsondecode(aws_iam_role_policy.radius.policy).Statement : s.Action]), "kms:Encrypt") &&
+      !contains(flatten([for s in jsondecode(aws_iam_role_policy.radius.policy).Statement : s.Action]), "dynamodb:PutItem") &&
+      !contains(flatten([for s in jsondecode(aws_iam_role_policy.radius.policy).Statement : s.Action]), "ds:ResetUserPassword")
+    )
+    error_message = "RADIUS may verify OTPs, not register seeds or reset AD passwords."
+  }
+
+  assert {
+    condition = (
       toset(jsondecode(aws_iam_role_policy.github_auth.policy).Statement[3].Resource) ==
       toset([aws_appstream_stack.main.arn, aws_appstream_fleet.main.arn])
     )
@@ -323,6 +423,19 @@ run "home_folder_removal_enabled_by_default" {
   assert {
     condition     = length(terraform_data.disable_home_folders) == 1
     error_message = "Existing stacks must have their home folder connector removed by default."
+  }
+}
+
+run "radius_readiness_enabled_by_default" {
+  command = plan
+
+  variables {
+    wait_for_radius_ready = true
+  }
+
+  assert {
+    condition     = length(terraform_data.radius_ready) == 1
+    error_message = "Production applies must wait for actual RADIUS bootstrap and service readiness."
   }
 }
 

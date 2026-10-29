@@ -75,3 +75,9 @@ variable "disable_home_folders_with_cli" {
   type        = bool
   default     = true
 }
+
+variable "wait_for_radius_ready" {
+  description = "Wait for successful RADIUS bootstrap using AWS CLI before enabling MFA. Disable only for offline mock tests."
+  type        = bool
+  default     = true
+}

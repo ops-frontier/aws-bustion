@@ -101,4 +101,4 @@ Lambda はログインごとに最新の Secret を読み取るため、値の�
 
 GitHub のアクセストークンは本人・メンバーシップ確認にだけ使用し、Lambda の処理後に永続保存しません。リフレッシュトークンによる継続利用もしません。ただし保存しないことと GitHub 側で失効することは別です。利用を取り消す場合は、GitHub の **Settings → Applications → Authorized OAuth Apps** から認可を取り消してください。
 
-Client Secret が漏えいした場合は GitHub 側で再発行し、Secrets Manager の値を更新した後、古い Secret を失効させます。OAuth App を削除しても開始済みのセッションは終了しません。Organization からの削除は次回 OAuth ログインから反映されます。認証後のブラウザーセッションは最大 1 時間有効で、既存の WorkSpaces クライアント接続は AD 認証です。即時遮断が必要ならポータルのセッション失効と、AppStream セッション終了または AD ユーザーの無効化なども管理者が実施してください。
+Client Secret が漏えいした場合は GitHub 側で再発行し、Secrets Manager の値を更新した後、古い Secret を失効させます。OAuth App を削除しても開始済みのセッションは終了しません。Organization からの削除は次回 OAuth ログインから反映されます。認証後のブラウザーセッションは最大 1 時間有効で、WorkSpaces クライアントの新規接続は AD パスワードと RADIUS MFA の OTP で認証します。既存の接続は即時終了しません。即時遮断が必要ならポータルのセッション失効と、AppStream セッション終了または AD ユーザーの無効化なども管理者が実施してください。

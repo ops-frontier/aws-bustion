@@ -47,3 +47,12 @@ output "github_oauth_secret_arn" {
   description = "Populate this secret with a JSON object containing client_id and client_secret outside Terraform."
   value       = aws_secretsmanager_secret.github_oauth.arn
 }
+output "radius_instance_id" {
+  description = "Private FreeRADIUS instance; manage through SSM, not SSH."
+  value       = aws_instance.radius.id
+}
+
+output "mfa_table_name" {
+  description = "Encrypted OTP records; deleting an active record requires verified recovery."
+  value       = aws_dynamodb_table.mfa.name
+}

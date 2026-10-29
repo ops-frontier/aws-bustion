@@ -15,9 +15,12 @@ from urllib.parse import parse_qs, quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import boto3
+import qrcode
+import qrcode.image.svg
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from mfa import MFAError, MFAStore
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.INFO)
@@ -234,6 +237,7 @@ def page_response(status, title, body, head=""):
         "header img{width:12rem;max-width:100%;height:auto;justify-self:start;}"
         ".service-title{margin:0;font-size:1.5rem;font-weight:bold;}"
         "main{box-sizing:border-box;max-width:48rem;padding:2rem;margin:auto;}"
+        "main svg{width:18rem;max-width:100%;height:auto;}"
         "h1{font-size:1.5rem;}p{line-height:1.8;}"
         "@media(max-width:64rem){header{grid-template-columns:minmax(0,1fr);}"
         ".service-title{grid-row:2;}}"
@@ -481,7 +485,44 @@ def update_user(session, expression, values):
     )
 
 
-def password_response(session, message="", status=200):
+def mfa_store():
+    return MFAStore(
+        aws_client("dynamodb"), aws_client("kms"),
+        os.environ["MFA_TABLE"], os.environ["MFA_KEY_ARN"],
+    )
+
+
+def enrollment_fields(session):
+    store = mfa_store()
+    record = store.prepare(session["login"]["S"], session["user_id"]["S"])
+    if record["active"]["BOOL"]:
+        return "<p>認証アプリの登録は完了しています。</p>"
+    secret = base64.b32encode(store.secret(record)).decode("ascii").rstrip("=")
+    issuer = "Bustion-" + os.environ["GITHUB_ORGANIZATION"]
+    uri = "otpauth://totp/" + quote(issuer + ":" + session["login"]["S"], safe="") + "?" + urlencode({
+        "secret": secret, "issuer": issuer, "algorithm": "SHA1", "digits": 6, "period": 30,
+    })
+    image = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage)
+    svg = image.to_string().decode("utf-8")
+    return (
+        "<h2>認証アプリを登録してください</h2>"
+        "<p>認証アプリで QR コードを読み取ってください。登録は 10 分間有効です。"
+        "この QR コードと登録キーは他人に共有しないでください。</p>"
+        f'{svg}<p>手動登録キー: <code>{secret}</code></p>'
+        '<p><label>確認コード <input name="otp" inputmode="numeric" pattern="[0-9]{6}" '
+        'minlength="6" maxlength="6" autocomplete="one-time-code" required></label></p>'
+    )
+
+
+def password_response(session, message="", status=200, *, password_required=True):
+    password_fields = (
+        '<p><label>パスワード <input type="password" name="password" '
+        'required minlength="8" maxlength="127" autocomplete="new-password"></label></p>'
+        '<p><label>パスワードの確認 <input type="password" name="confirm" '
+        'required minlength="8" maxlength="127" autocomplete="new-password"></label></p>'
+        "<p>8〜127 文字で、英大文字・英小文字・数字・記号のうち 3 種類以上を使用し、"
+        "ユーザー名を含めないでください。ディレクトリのポリシーも適用されます。</p>"
+    ) if password_required else ""
     return page_response(
         status, "パーソナルデスクトップの初回登録",
         "<h1>パーソナルデスクトップの初回登録</h1>"
@@ -490,12 +531,7 @@ def password_response(session, message="", status=200):
         "変更された場合、パーソナルデスクトップの利用を拒否します。</p>"
         f"<p>{escape(message)}</p>"
         f'<form method="post" action="/windows">{csrf_field(session)}'
-        '<p><label>パスワード <input type="password" name="password" '
-        'required minlength="8" maxlength="127" autocomplete="new-password"></label></p>'
-        '<p><label>パスワードの確認 <input type="password" name="confirm" '
-        'required minlength="8" maxlength="127" autocomplete="new-password"></label></p>'
-        "<p>8〜127 文字で、英大文字・英小文字・数字・記号のうち 3 種類以上を使用し、"
-        "ユーザー名を含めないでください。ディレクトリのポリシーも適用されます。</p>"
+        f"{password_fields}{enrollment_fields(session)}"
         '<button type="submit">登録してパーソナルデスクトップを準備する</button></form>',
     )
 
@@ -698,16 +734,34 @@ def windows_response(event, key, session, form):
     try:
         # Refresh after locking; another request may have completed registration.
         record = user_record(session)
+        ad_ready = record.get("ad_ready", {}).get("BOOL", False)
+        if ad_ready:
+            user = directory_user(session)
+            if user is None or not user.get("Enabled"):
+                raise AuthError(403, "directory_user_unavailable", "登録済みユーザーが削除または無効化されています。管理者にお問い合わせください。")
+        store = mfa_store()
+        enrollment = store.prepare(session["login"]["S"], session["user_id"]["S"])
+        if not enrollment["active"]["BOOL"]:
+            if form is None or "otp" not in form:
+                return password_response(session, password_required=not ad_ready)
+            try:
+                store.verify(
+                    session["login"]["S"], form["otp"], enrolling=True,
+                    user_id=session["user_id"]["S"],
+                )
+            except MFAError as error:
+                LOGGER.warning("OTP enrollment rejected: %s", error)
+                return password_response(
+                    session, "確認コードが無効、使用済み、または試行上限に達しました。"
+                    "端末の時刻を確認し、上限の場合は 5 分待ってから再入力してください。",
+                    403, password_required=not ad_ready,
+                )
         if not record.get("ad_ready", {}).get("BOOL"):
             if form is None or "password" not in form:
                 return password_response(session)
             result = register_directory_user(session, form)
             if result is not None:
                 return result
-        else:
-            user = directory_user(session)
-            if user is None or not user.get("Enabled"):
-                raise AuthError(403, "directory_user_unavailable", "登録済みユーザーが削除または無効化されています。管理者にお問い合わせください。")
         return workspace_response(session, record)
     finally:
         db.update_item(
@@ -763,6 +817,13 @@ def lambda_handler(event, context):
                 return launch_linux(session)
             return windows_response(event, key, session, form)
         return page_response(404, "ページが見つかりません", '<h1>ページが見つかりません</h1><p><a href="/login">ログイン</a></p>')
+    except MFAError as error:
+        LOGGER.warning("OTP enrollment unavailable: %s", error)
+        return page_response(
+            403, "認証アプリを登録できません",
+            "<p>登録状態が変更されたか、有効期限が切れました。再試行してください。"
+            '解決しない場合は管理者にお問い合わせください。</p><p><a href="/windows">再試行</a></p>',
+        )
     except AuthError as error:
         LOGGER.warning("Authentication rejected: %s", error.code)
         return page_response(

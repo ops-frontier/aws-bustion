@@ -1,0 +1,63 @@
+#cloud-config
+package_update: true
+packages:
+  - freeradius
+  - freeradius-python3
+  - python3-boto3
+  - chrony
+write_files:
+  - path: /etc/bustion-radius.json
+    permissions: '0644'
+    encoding: b64
+    content: ${config}
+  - path: /opt/bustion-radius/mfa.py
+    permissions: '0644'
+    encoding: b64
+    content: ${mfa}
+  - path: /opt/bustion-radius/radius_auth.py
+    permissions: '0644'
+    encoding: b64
+    content: ${radius_auth}
+  - path: /opt/bustion-radius/configure.py
+    permissions: '0700'
+    encoding: b64
+    content: ${configure}
+  - path: /etc/freeradius/3.0/sites-available/bustion
+    defer: true
+    permissions: '0644'
+    encoding: b64
+    content: ${server}
+  - path: /etc/freeradius/3.0/mods-available/python3
+    defer: true
+    permissions: '0644'
+    encoding: b64
+    content: ${python3}
+  - path: /etc/systemd/system/freeradius.service.d/bustion.conf
+    permissions: '0644'
+    content: |
+      [Service]
+      ExecStartPre=
+      ExecStartPre=/usr/sbin/freeradius -C
+      Restart=on-failure
+      RestartSec=10
+  - path: /etc/chrony/chrony.conf
+    defer: true
+    permissions: '0644'
+    content: |
+      server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
+      driftfile /var/lib/chrony/chrony.drift
+      makestep 1.0 3
+      rtcsync
+runcmd:
+  - |
+    set -eu
+    systemctl stop freeradius
+    rm -f /etc/freeradius/3.0/sites-enabled/default /etc/freeradius/3.0/sites-enabled/inner-tunnel
+    rm -f /etc/freeradius/3.0/mods-enabled/eap
+    ln -sf ../sites-available/bustion /etc/freeradius/3.0/sites-enabled/bustion
+    ln -sf ../mods-available/python3 /etc/freeradius/3.0/mods-enabled/python3
+    python3 /opt/bustion-radius/configure.py
+    systemctl restart chrony
+    systemctl daemon-reload
+    freeradius -C
+    systemctl enable --now freeradius

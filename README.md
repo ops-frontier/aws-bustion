@@ -9,7 +9,7 @@ GitHub 認証後の選択画面では、次の 2 種類の端末を選べます�
 | 呼び名 | 旧称 / 基盤 | 用途・接続方法 |
 | --- | --- | --- |
 | セキュアブラウザ | 旧称: AWA Linux / Amazon AppStream 2.0（WorkSpaces Applications）の Linux 環境 | ブラウザーからリモートの Linux デスクトップに接続し、Chrome や VS Code で Web サービス・開発環境を利用します。専用クライアントは不要です。 |
-| パーソナルデスクトップ | 旧称: AWP Windows / Amazon WorkSpaces Personal の Windows 環境 | 利用者ごとに割り当てられた Windows デスクトップを利用します。事前に WorkSpaces DCV クライアントをインストールし、初回に設定するディレクトリのパスワードで接続します。 |
+| パーソナルデスクトップ | 旧称: AWP Windows / Amazon WorkSpaces Personal の Windows 環境 | 利用者ごとに割り当てられた Windows デスクトップを利用します。事前に WorkSpaces DCV クライアントをインストールし、初回に設定するディレクトリのパスワードと認証アプリの OTP で接続します。 |
 
 ### セキュアブラウザ
 
@@ -17,7 +17,7 @@ Web サービスや開発環境へのアクセスに使うリモート環境で�
 
 ### パーソナルデスクトップ
 
-Windows アプリケーションや、利用者専用の継続的な作業環境が必要な場合に使用します。初回にディレクトリユーザーと WorkSpace をオンデマンドで作成し、以降は同じ WorkSpace を再利用します。GitHub ユーザー名は 20 文字以下で、予約名（Admin、Administrator、Guest、krbtgt）以外である必要があり、登録後は変更しないでください。ポータルは GitHub OAuth、端末への接続はディレクトリのパスワードで認証します。構成・制約・導入手順は [WINDOWS-AWP.md](WINDOWS-AWP.md#実装と導入) を参照してください。
+Windows アプリケーションや、利用者専用の継続的な作業環境が必要な場合に使用します。初回にパスワードと認証アプリを登録し、ディレクトリユーザーと WorkSpace をオンデマンドで作成します。以降は同じ WorkSpace を再利用します。GitHub ユーザー名は 20 文字以下で、予約名（Admin、Administrator、Guest、krbtgt）以外である必要があり、登録後は変更しないでください。ポータルは GitHub OAuth、端末への接続は AD パスワードと TOTP（RADIUS MFA）で認証します。構成・制約・導入手順は [WINDOWS-AWP.md](WINDOWS-AWP.md#実装と導入) を参照してください。
 
 ## 現在の実装範囲
 
@@ -28,6 +28,7 @@ Windows アプリケーションや、利用者専用の継続的な作業環境
 - API Gateway + Lambda による GitHub OAuth 認証、Organization メンバーシップ確認、AppStream 起動
 - Secrets Manager による OAuth 資格情報管理、DynamoDB による一回限りの OAuth state 管理
 - 共有ポータルからの WorkSpaces Personal オンデマンド登録（[構成と導入](WINDOWS-AWP.md#実装と導入)）
+- プライベート EC2 1 台の FreeRADIUS、QR コードによる TOTP 登録、Managed Microsoft AD の RADIUS MFA
 - Codespaces 内の Python 3 / AWS CLI / Terraform と MFA ログインスクリプト
 
 Terraform は公開済みの AppStream イメージを使用します。イメージのビルド・公開処理は含まれていません。AppStream Image Builder で Chrome、VS Code、日本語環境を含むイメージを作成し、そのイメージ名を Codespaces Secret の `APPSTREAM_IMAGE_NAME` に設定してください。Packer の `amazon-ebs` が作成する EC2 AMI は AppStream イメージとして直接利用できません。
@@ -91,6 +92,7 @@ python3 scripts/login.py
 aws sts get-caller-identity --profile terraform-role
 cd terraform
 terraform init
+bash ../scripts/build_qr_layer.sh
 terraform plan
 terraform apply
 terraform output -raw appstream_login_url
@@ -120,6 +122,7 @@ Terraform state は現在ローカルに保存されます。Codespace を削除
 - リージョナル NAT Gateway、AppStream、共有ポータルで使用する Managed Microsoft AD と WorkSpaces には継続的な料金が発生します。不要時の破棄手順は [WINDOWS-AWP.md](WINDOWS-AWP.md#適用手順) を参照してください。実行時に作成した WorkSpace は `terraform destroy` の管理対象外です。
 - AppStream のサービスロール `AmazonAppStreamServiceAccess` は他の AppStream 環境と共用するため Terraform では管理せず、`terraform destroy` でも削除されません。事前に作成しておく必要があります（[AWS-SETUP.md](AWS-SETUP.md) を参照）。
 - 認証用の API Gateway、Lambda、DynamoDB、Secrets Manager、CloudWatch Logs にも料金が発生します。Lambda は VPC に接続せず、GitHub と AWS API にアクセスします。
+- RADIUS の `t4g.micro`（1 GiB）1 台と暗号化 EBS、KMS にも料金が発生します。MFA 有効化はディレクトリ全体に適用され、既存ユーザーもポータルで OTP 登録が必要です。単一 RADIUS の障害中は新規接続できません。MFA は漏洩パスワード単独の悪用を防ぎますが、フィッシングや端末侵害を完全に排除するものではありません。
 - ホームフォルダ保存（`HOMEFOLDERS`）は無効です。セッション終了後、インスタンス上のファイルや Chrome / VS Code の設定は残りません。AWS provider はストレージコネクターの削除を反映しないため、apply 時に AWS CLI（`terraform-role` プロファイル）で既存 Stack から削除します。既存の S3 バケット内のデータは削除されません。Linux 非対応の Application Settings 永続化も明示的に無効にしています。
 - 起動 URL の有効期限は 60 秒です。URL 自体がアクセス権になるため、共有・ログ保存しないでください。この期限はセッションの最大利用時間ではありません。
 - Organization の利用権限は OAuth ログイン時に毎回確認します。認証後のブラウザーセッションは最大 1 時間有効です。メンバーを削除しても既存のセッションは即時失効しません。必要な場合は管理者がセッションを終了してください。
